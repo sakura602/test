@@ -11,6 +11,8 @@ import pickle
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+import traceback
+import sys
 from sklearn.manifold import TSNE
 from improved_timegan_model import TimeGAN
 from conditional_timegan_model import ConditionalTimeGAN
@@ -25,6 +27,27 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 import seaborn as sns
 from sklearn.decomposition import PCA
+
+# 全局异常处理
+def global_exception_handler(exctype, value, tb):
+    print(''.join(traceback.format_exception(exctype, value, tb)))
+    sys.exit(1)
+
+sys.excepthook = global_exception_handler
+
+print("脚本开始执行...")
+print(f"Python 版本: {sys.version}")
+print(f"PyTorch 版本: {torch.__version__}")
+print(f"NumPy 版本: {np.__version__}")
+print(f"当前工作目录: {os.getcwd()}")
+print(f"脚本文件: {__file__}")
+print(f"导入的模块: {sys.modules.keys()}")
+try:
+    print(f"TimeGAN 类: {TimeGAN}")
+    print(f"ConditionalTimeGAN 类: {ConditionalTimeGAN}")
+except Exception as e:
+    print(f"导入类时出错: {e}")
+    raise
 
 def load_apt_sequences(file_path):
     """加载APT攻击序列
@@ -273,6 +296,7 @@ def main():
     generate_target = {i+1: generate_nums[i] for i in range(len(generate_nums)) if i < 4}
     
     if args.mode in ['train', 'train_and_generate']:
+        print("进入训练模式...")
         # 平衡训练数据
         if args.balance:
             # 计算每个标签的目标数量
@@ -291,34 +315,60 @@ def main():
         print(f"预处理后的数据形状: {processed_data.shape}")
         
         # 创建ConditionalTimeGAN模型
-        model = ConditionalTimeGAN(
-            feature_dim=args.feature_dim,
-            hidden_dim=args.hidden_dim,
-            z_dim=args.z_dim,
-            num_categories=4,  # APT类型数量
-            embedding_dim=8,    # 类别嵌入维度
-            gamma=args.gamma,
-            learning_rate=args.learning_rate,
-            max_seq_len=args.max_seq_len,
-            device=device,
-            num_layers=args.num_layers
-        )
+        print("创建ConditionalTimeGAN模型...")
+        try:
+            model = ConditionalTimeGAN(
+                feature_dim=args.feature_dim,
+                hidden_dim=args.hidden_dim,
+                z_dim=args.z_dim,
+                num_categories=4,  # APT类型数量
+                embedding_dim=8,    # 类别嵌入维度
+                gamma=args.gamma,
+                learning_rate=args.learning_rate,
+                max_seq_len=args.max_seq_len,
+                device=device,
+                num_layers=args.num_layers
+            )
+            print("ConditionalTimeGAN模型创建成功")
+        except Exception as e:
+            print(f"创建ConditionalTimeGAN模型时出错: {e}")
+            raise
         
         # 创建TensorDataset和DataLoader
+        print("创建TensorDataset和DataLoader...")
         tensor_x = torch.Tensor(processed_data)
+        print(f"tensor_x 形状: {tensor_x.shape}, 类型: {tensor_x.dtype}")
         train_dataset = TensorDataset(tensor_x)
+        print(f"train_dataset 类型: {type(train_dataset)}, 长度: {len(train_dataset)}")
         train_data_loader = DataLoader(
             train_dataset, 
             batch_size=args.batch_size, 
             shuffle=True
         )
+        print(f"train_data_loader 类型: {type(train_data_loader)}, 批次数: {len(train_data_loader)}")
+        print("DataLoader创建成功")
+        
+        # 测试 DataLoader 返回的数据类型
+        print("测试 DataLoader 返回的数据类型...")
+        for batch_idx, batch_data in enumerate(train_data_loader):
+            print(f"批次 {batch_idx}: 类型: {type(batch_data)}, 长度: {len(batch_data)}")
+            print(f"batch_data[0] 类型: {type(batch_data[0])}, 形状: {batch_data[0].shape}")
+            break
         
         # 训练模型
-        model.fit(
-            train_data_loader=train_data_loader,
-            epochs=args.epochs,
-            verbose=args.verbose
-        )
+        print("开始训练模型...")
+        try:
+            model.fit(
+                train_data_loader=train_data_loader,
+                epochs=args.epochs,
+                verbose=args.verbose
+            )
+            print("模型训练完成")
+        except Exception as e:
+            print(f"训练模型时出错: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
         
         # 保存模型
         os.makedirs(os.path.dirname(args.model_path), exist_ok=True)
