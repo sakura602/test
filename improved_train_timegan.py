@@ -344,7 +344,7 @@ def parse_arguments():
     parser.add_argument('--hidden_dim', type=int, default=24, help='隐藏层维度')
     parser.add_argument('--z_dim', type=int, default=24, help='噪声维度')
     parser.add_argument('--num_layers', type=int, default=3, help='RNN层数')
-    parser.add_argument('--gamma', type=float, default=1.0, help='判别器损失权重')
+    parser.add_argument('--gamma', type=float, default=3.0, help='判别器损失权重')
     parser.add_argument('--epochs', type=int, default=200, help='训练轮数')
     parser.add_argument('--pre_train_epochs', type=int, default=10, help='预训练轮数')
     parser.add_argument('--batch_size', type=int, default=32, help='批量大小')
@@ -553,7 +553,7 @@ def main():
                     print(f"从检查点恢复训练，起始轮数: {start_epoch}")
             else:
                 if not QUIET:
-                    print(f"检查点文件 {args.checkpoint_path} 不存在，从头开始训练")
+                    print(f"从头开始训练")
         
         # 训练模型
         model.fit(
@@ -570,6 +570,7 @@ def main():
         # 训练完成后保存模型
         model.save(args.model_path)
         if not QUIET:
+            print(f"训练完成")
             print(f"模型已保存到 {args.model_path}")
         
         # 保存归一化器和预处理信息
@@ -619,7 +620,7 @@ def main():
             model = ConditionalTimeGAN.load(args.model_path, device)
         except Exception as e:
             if not QUIET:
-                print(f"无法使用类方法加载模型，尝试手动加载: {e}")
+                print(f"手动加载模型")
             # 手动加载模型状态
             checkpoint = torch.load(args.model_path, map_location=device)
             
@@ -637,7 +638,7 @@ def main():
                 learning_rate=args.learning_rate
             )
             
-            # 尝试加载状态字典，处理不同的键名格式
+            # 尝试加载状态字典
             try:
                 # 尝试直接加载模型状态字典
                 if 'model_state_dict' in checkpoint:
@@ -650,11 +651,9 @@ def main():
                     model.discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
                     model.supervisor.load_state_dict(checkpoint['supervisor_state_dict'])
                 else:
-                    raise ValueError("模型文件格式不正确，无法找到状态字典")
+                    raise ValueError("模型文件格式不正确")
             except Exception as load_error:
-                print(f"加载模型状态时出错: {load_error}")
-                if VERBOSE and not QUIET:
-                    print("模型键名:", list(checkpoint.keys()))
+                print(f"加载模型状态时出错")
                 return
             
             model.to(device)
@@ -766,23 +765,19 @@ def main():
         with open(os.path.join(args.output_dir, 'generated_sequences.json'), 'w') as f:
             json.dump(generated_sequences, f, indent=2)
         
-        # 保存生成元数据
+        # 保存生成元数据（简化版本）
         generation_metadata = {
             'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'model_path': args.model_path,
-            'noise_scale': args.noise_scale,
-            'max_seq_len': args.max_seq_len,
-            'feature_dim': args.feature_dim,
             'num_generated': len(generated_sequences),
             'label_distribution': {int(k): int(v) for k, v in zip(*np.unique(generated_labels, return_counts=True))}
         }
-        
+
         with open(os.path.join(args.output_dir, 'generation_metadata.json'), 'w') as f:
             json.dump(generation_metadata, f, indent=2)
-        
+
         if not QUIET:
             print(f"生成的序列已保存到 {os.path.join(args.output_dir, 'generated_sequences.json')}")
-            print(f"生成元数据已保存到 {os.path.join(args.output_dir, 'generation_metadata.json')}")
     
     else:
         print(f"不支持的模式: {args.mode}")
@@ -1094,54 +1089,152 @@ def evaluate_generated_data(real_data, generated_data, real_labels, generated_la
     # 基本评估指标
     metrics = {}
     
+    # 记录评估开始时间
+    start_time = time.time()
+    
+    # 记录数据集大小信息
+    metrics['real_data_shape'] = list(real_data.shape)
+    metrics['generated_data_shape'] = list(generated_data.shape)
+    print(f"真实数据形状: {real_data.shape}, 生成数据形状: {generated_data.shape}")
+    
+    # 确保用于评估的数据量不会过大，可能导致内存问题
+    max_eval_samples = min(len(real_data), len(generated_data), 1000)  # 最多使用1000个样本进行评估
+    if len(real_data) > max_eval_samples or len(generated_data) > max_eval_samples:
+        print(f"注意: 数据集较大，将使用随机抽样的{max_eval_samples}个样本进行评估")
+        
+        # 随机抽样
+        real_indices = np.random.choice(len(real_data), max_eval_samples, replace=False)
+        gen_indices = np.random.choice(len(generated_data), max_eval_samples, replace=False)
+        
+        real_data_eval = real_data[real_indices]
+        real_labels_eval = real_labels[real_indices]
+        generated_data_eval = generated_data[gen_indices]
+        generated_labels_eval = generated_labels[gen_indices]
+    else:
+        # 使用所有数据
+        real_data_eval = real_data
+        real_labels_eval = real_labels
+        generated_data_eval = generated_data[:len(real_data)]
+        generated_labels_eval = generated_labels[:len(real_labels)]
+    
+    print(f"评估数据形状 - 真实: {real_data_eval.shape}, 生成: {generated_data_eval.shape}")
+    
     # 判别性分数
-    discriminative_score = calculate_discriminative_score_rf(real_data, generated_data[:len(real_data)])
+    print("计算判别性分数...")
+    discriminative_score = calculate_discriminative_score_rf(real_data_eval, generated_data_eval)
     metrics['discriminative_score'] = discriminative_score
     print(f"判别性分数 (RF Accuracy)：{discriminative_score:.4f} (理想值: 0.5)")
     
     # 预测性分数
-    predictive_score = calculate_predictive_score(real_data, generated_data[:len(real_data)])
+    print("计算预测性分数...")
+    predictive_score = calculate_predictive_score(real_data_eval, generated_data_eval)
     metrics['predictive_score'] = predictive_score
     print(f"预测性分数 (MAE比率)：{predictive_score:.4f} (理想值: 1.0)")
     
     # 详细评估
     if detailed:
+        print("进行详细评估...")
+        
         # 时间一致性
-        temporal_consistency = calculate_temporal_consistency(real_data, generated_data[:len(real_data)])
+        print("计算时间一致性...")
+        temporal_consistency = calculate_temporal_consistency(real_data_eval, generated_data_eval)
         metrics['temporal_consistency'] = temporal_consistency
         print(f"时间一致性分数：{temporal_consistency:.4f} (理想值: 1.0)")
         
         # 标签一致性
-        label_consistency = calculate_label_consistency(real_labels, generated_labels[:len(real_labels)])
+        print("计算标签一致性...")
+        label_consistency = calculate_label_consistency(real_labels_eval, generated_labels_eval)
         metrics['label_consistency'] = label_consistency
         print(f"标签一致性分数：{label_consistency:.4f} (理想值: 1.0)")
         
         # 特征重要性
-        feature_importance = calculate_feature_importance(real_data, generated_data[:len(real_data)])
+        print("计算特征重要性...")
+        feature_importance = calculate_feature_importance(real_data_eval, generated_data_eval)
         top_features = np.argsort(feature_importance)[-5:]
         print(f"最重要的5个特征索引: {top_features}")
         print(f"对应的重要性值: {feature_importance[top_features]}")
         metrics['top_features'] = top_features.tolist()
         metrics['top_feature_importance'] = feature_importance[top_features].tolist()
+        
+        # 计算每个标签类别的评估指标
+        print("计算各标签类别的评估指标...")
+        label_metrics = {}
+        unique_labels = sorted(set(real_labels_eval) | set(generated_labels_eval))
+        
+        for label in unique_labels:
+            print(f"处理标签 {label}...")
+            # 筛选特定标签的数据
+            real_indices = np.where(real_labels_eval == label)[0]
+            gen_indices = np.where(generated_labels_eval == label)[0]
+            
+            if len(real_indices) > 0 and len(gen_indices) > 0:
+                real_data_label = real_data_eval[real_indices]
+                gen_data_label = generated_data_eval[gen_indices]
+                
+                # 计算该标签的判别性分数和预测性分数
+                try:
+                    disc_score = calculate_discriminative_score_rf(real_data_label, gen_data_label)
+                    pred_score = calculate_predictive_score(real_data_label, gen_data_label)
+                    
+                    label_metrics[str(label)] = {
+                        'discriminative_score': float(disc_score),
+                        'predictive_score': float(pred_score),
+                        'real_count': int(len(real_indices)),
+                        'generated_count': int(len(gen_indices))
+                    }
+                    
+                    print(f"标签 {label} - 判别性分数: {disc_score:.4f}, 预测性分数: {pred_score:.4f}")
+                except Exception as e:
+                    print(f"计算标签 {label} 的指标时出错: {e}")
+                    label_metrics[str(label)] = {
+                        'error': str(e),
+                        'real_count': int(len(real_indices)),
+                        'generated_count': int(len(gen_indices))
+                    }
+            else:
+                print(f"标签 {label} 的样本不足，无法计算指标")
+                label_metrics[str(label)] = {
+                    'error': '样本不足',
+                    'real_count': int(len(real_indices)),
+                    'generated_count': int(len(gen_indices))
+                }
+        
+        metrics['label_metrics'] = label_metrics
     
     # 可视化
-    if visualize:
+    if visualize and not QUIET:
+        print("生成可视化图表...")
+        
         # t-SNE可视化
-        visualize_tsne(real_data, generated_data[:len(real_data)], real_labels, output_dir)
+        print("生成t-SNE可视化...")
+        visualize_tsne(real_data_eval, generated_data_eval, real_labels_eval, output_dir)
         
         if detailed:
             # 特征重要性可视化
+            print("生成特征重要性可视化...")
             visualize_feature_importance(feature_importance, output_dir)
             
             # 时间模式可视化
-            visualize_temporal_patterns(real_data, generated_data[:len(real_data)], output_dir)
+            print("生成时间模式可视化...")
+            visualize_temporal_patterns(real_data_eval, generated_data_eval, output_dir)
             
             # 标签分布可视化
-            visualize_label_distribution(real_labels, generated_labels[:len(real_labels)], output_dir)
+            print("生成标签分布可视化...")
+            visualize_label_distribution(real_labels_eval, generated_labels_eval, output_dir)
     
-    # 保存评估指标
-    with open(os.path.join(output_dir, 'evaluation_metrics.json'), 'w') as f:
+    # 记录评估结束时间和总耗时
+    end_time = time.time()
+    evaluation_time = end_time - start_time
+    metrics['evaluation_time'] = evaluation_time
+    print(f"评估完成，总耗时: {evaluation_time:.2f}秒")
+    
+    # 只保存生成序列的评估指标
+    metrics_file = os.path.join(output_dir, 'evaluation_metrics.json')
+    with open(metrics_file, 'w') as f:
         json.dump(metrics, f, indent=2)
+    
+    if not QUIET:
+        print(f"评估指标已保存到: {metrics_file}")
     
     return metrics
 
