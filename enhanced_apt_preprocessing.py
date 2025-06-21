@@ -240,9 +240,9 @@ class EnhancedAPTPreprocessor:
         print(f"✅ 编码和归一化完成，数据形状: {self.df.shape}")
         return self
 
-    def select_features_with_rf_cv(self, n_features=46, n_estimators=100, cv_folds=10):
-        """基于10折CV的鲁棒随机森林特征选择，只用数值特征"""
-        print(f"\n🌲 用{cv_folds}折CV做鲁棒特征选择，目标Top {n_features}")
+    def prepare_paper_aligned_features(self):
+        """按论文方法准备特征：只用网络流特征+时间特征，排除Activity等标签信息"""
+        print(f"\n🎯 按论文方法准备特征（排除Activity等标签信息）")
 
         # 确定目标变量
         if 'Stage_encoded' in self.df.columns:
@@ -252,131 +252,307 @@ class EnhancedAPTPreprocessor:
         else:
             raise ValueError("找不到目标变量列")
 
-        # 只保留数值列，并排除目标
-        num_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
-        feature_cols = [c for c in num_cols if c != target]
+        # 获取所有数值特征
+        numeric_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
 
-        X = self.df[feature_cols]
-        y = self.df[target]
+        # 排除目标变量和Activity相关的编码列（避免标签泄露）
+        exclude_cols = [target, 'Activity_encoded', 'Stage_encoded']
+        if target == 'Stage_encoded':
+            exclude_cols.remove('Stage_encoded')  # 如果Stage_encoded是目标，就不排除它
 
-        print(f"数值特征总数: {len(feature_cols)}, 样本数: {len(X)}")
+        feature_cols = [col for col in numeric_cols if col not in exclude_cols]
 
-        skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
-        freq = pd.Series(0, index=feature_cols)
+        # 确保时间特征被包含（论文Table 3中的关键特征）
+        time_features = ['hour', 'minute', 'day_of_week']  # 移除second，按论文只用这3个
+        for tf in time_features:
+            if tf in self.df.columns and tf not in feature_cols:
+                feature_cols.append(tf)
 
-        print("🔄 折内选特征中…")
-        for fold, (tr, _) in enumerate(skf.split(X, y), 1):
-            X_tr, y_tr = X.iloc[tr], y.iloc[tr]
-            selector = SelectFromModel(
-                RandomForestClassifier(n_estimators=n_estimators,
-                                       random_state=42,
-                                       n_jobs=-1),
-                max_features=n_features
-            ).fit(X_tr, y_tr)
-            chosen = X_tr.columns[selector.get_support()]
-            freq[chosen] += 1
-            print(f"  折 {fold:2d}: 选中 {len(chosen)} 个特征")
+        # 确保Protocol编码被包含（网络特征的一部分）
+        if 'Protocol_encoded' in self.df.columns and 'Protocol_encoded' not in feature_cols:
+            feature_cols.append('Protocol_encoded')
 
-        # 汇总选频，取Top n_features
-        self.selected_features = freq.sort_values(ascending=False).head(n_features).index.tolist()
-        print("✅ 最终Top特征：")
-        for i, f in enumerate(self.selected_features, 1):
-            print(f"  {i:2d}. {f}")
+        print(f"网络流特征数量: {len([f for f in feature_cols if f not in time_features + ['Protocol_encoded']])}")
+        print(f"时间特征数量: {len([f for f in feature_cols if f in time_features])}")
+        print(f"协议特征数量: {len([f for f in feature_cols if f == 'Protocol_encoded'])}")
+        print(f"候选特征总数: {len(feature_cols)}")
 
+        # 检查是否意外包含了Activity
+        activity_features = [f for f in feature_cols if 'activity' in f.lower()]
+        if activity_features:
+            print(f"⚠️ 警告：发现Activity相关特征，将被移除: {activity_features}")
+            feature_cols = [f for f in feature_cols if f not in activity_features]
+
+        self.candidate_features = feature_cols
         return self
 
-    def evaluate_multiple_models(self, cv_folds=10):
-        """在已选特征上，用10折CV对多模型做Macro指标评估"""
-        print(f"\n🎯 用{cv_folds}折CV评估多模型…")
+    def evaluate_with_fold_internal_pipeline(self, n_features=46, cv_folds=10):
+        """按论文方法：每折内部做特征选择+标准化+分类的完整pipeline"""
+        print(f"\n🎯 论文方法：每折内Pipeline(特征选择→标准化→分类)")
+
         # 准备数据
-        target = 'Stage_encoded' if 'Stage_encoded' in self.df else 'Label'
-        X = self.df[self.selected_features]
+        target = 'Stage_encoded' if 'Stage_encoded' in self.df.columns else 'Label'
+        X = self.df[self.candidate_features]
         y = self.df[target]
 
+        print(f"候选特征数量: {X.shape[1]}")
+        print(f"样本数量: {X.shape[0]}")
+        print(f"类别分布: {dict(y.value_counts().sort_index())}")
+
+        # 按论文配置模型
         models = {
             'RandomForest': RandomForestClassifier(
-                n_estimators=200, class_weight='balanced', random_state=42, n_jobs=-1),
+                n_estimators=300,
+                class_weight='balanced',
+                random_state=42,
+                n_jobs=-1
+            ),
             'MLP': MLPClassifier(
                 hidden_layer_sizes=(100,),
                 max_iter=1000,
                 early_stopping=True,
-                random_state=42),
-            'SVM': SVC(kernel='rbf', C=1.0, random_state=42)
+                learning_rate_init=1e-3,
+                random_state=42
+            ),
+            'SVM': SVC(
+                kernel='rbf',
+                C=1.0,
+                random_state=42
+            )
         }
 
         skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
         scoring = ['accuracy', 'precision_macro', 'recall_macro', 'f1_macro']
 
         self.cv_results = {}
+
         for name, clf in models.items():
             print(f"\n🚀 评估模型: {name}")
-            # MLP/SVM 前做标准化
-            if name in ('MLP', 'SVM'):
-                pipe = Pipeline([
-                    ('scaler', StandardScaler()),
+
+            # 构建折内Pipeline：特征选择 → 标准化 → 分类器
+            if name == 'RandomForest':
+                # RF不需要标准化，但需要特征选择
+                pipeline = Pipeline([
+                    ('feat_sel', SelectFromModel(
+                        RandomForestClassifier(n_estimators=100, random_state=42),
+                        max_features=n_features
+                    )),
                     ('clf', clf)
                 ])
             else:
-                pipe = clf
+                # MLP和SVM需要特征选择+标准化
+                pipeline = Pipeline([
+                    ('feat_sel', SelectFromModel(
+                        RandomForestClassifier(n_estimators=100, random_state=42),
+                        max_features=n_features
+                    )),
+                    ('scaler', StandardScaler()),
+                    ('clf', clf)
+                ])
 
-            res = cross_validate(
-                pipe, X, y,
+            # 交叉验证评估
+            cv_results = cross_validate(
+                pipeline, X, y,
                 cv=skf,
                 scoring=scoring,
                 n_jobs=-1,
                 return_train_score=False
             )
-            # 汇总
-            stats = {m: (res[f'test_{m}'].mean(), res[f'test_{m}'].std())
-                     for m in scoring}
-            for m, (mu, sd) in stats.items():
-                print(f"  {m:<15}: {mu:.4f} ± {sd:.4f}")
-            self.cv_results[name] = stats
+
+            # 计算统计量
+            results = {}
+            for metric in scoring:
+                scores = cv_results[f'test_{metric}']
+                results[metric] = {
+                    'mean': scores.mean(),
+                    'std': scores.std(),
+                    'scores': scores.tolist()
+                }
+                print(f"  {metric:<15}: {scores.mean():.4f} ± {scores.std():.4f}")
+
+            self.cv_results[name] = results
+
+        # 找出最佳模型
+        best_model = max(self.cv_results.keys(),
+                        key=lambda x: self.cv_results[x]['f1_macro']['mean'])
+        best_f1 = self.cv_results[best_model]['f1_macro']['mean']
+        print(f"\n🏆 最佳模型: {best_model} (F1: {best_f1:.4f})")
+
+        return self
+
+    def evaluate_multiple_models(self, cv_folds=10):
+        """按论文方法：用固定的46个特征，在10折CV中评估多模型"""
+        print(f"\n🎯 使用固定的{len(self.selected_features)}个特征进行{cv_folds}折交叉验证")
+
+        # 准备数据
+        target = 'Stage_encoded' if 'Stage_encoded' in self.df.columns else 'Label'
+        X = self.df[self.selected_features]
+        y = self.df[target]
+
+        print(f"特征数量: {X.shape[1]}")
+        print(f"样本数量: {X.shape[0]}")
+        print(f"类别分布: {dict(y.value_counts().sort_index())}")
+
+        # 按论文配置模型超参数
+        models = {
+            'RandomForest': RandomForestClassifier(
+                n_estimators=300,
+                class_weight='balanced',
+                random_state=42,
+                n_jobs=-1
+            ),
+            'MLP': MLPClassifier(
+                hidden_layer_sizes=(100,),
+                max_iter=1000,
+                early_stopping=True,
+                learning_rate_init=0.01,
+                random_state=42
+            ),
+            'SVM': SVC(
+                kernel='rbf',
+                C=1.0,
+                random_state=42
+            )
+        }
+
+        skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+        scoring = ['accuracy', 'precision_macro', 'recall_macro', 'f1_macro']
+
+        self.cv_results = {}
+
+        for name, clf in models.items():
+            print(f"\n🚀 评估模型: {name}")
+
+            # 对MLP和SVM使用Pipeline进行折内标准化
+            if name in ('MLP', 'SVM'):
+                estimator = Pipeline([
+                    ('scaler', StandardScaler()),
+                    ('clf', clf)
+                ])
+            else:
+                estimator = clf
+
+            # 使用cross_validate进行评估
+            from sklearn.model_selection import cross_validate
+            cv_results = cross_validate(
+                estimator, X, y,
+                cv=skf,
+                scoring=scoring,
+                n_jobs=-1,
+                return_train_score=False
+            )
+
+            # 计算统计量
+            results = {}
+            for metric in scoring:
+                scores = cv_results[f'test_{metric}']
+                results[metric] = {
+                    'mean': scores.mean(),
+                    'std': scores.std(),
+                    'scores': scores.tolist()
+                }
+                print(f"  {metric:<15}: {scores.mean():.4f} ± {scores.std():.4f}")
+
+            self.cv_results[name] = results
+
+        # 找出最佳模型
+        best_model = max(self.cv_results.keys(),
+                        key=lambda x: self.cv_results[x]['f1_macro']['mean'])
+        best_f1 = self.cv_results[best_model]['f1_macro']['mean']
+        print(f"\n🏆 最佳模型: {best_model} (F1: {best_f1:.4f})")
 
         return self
 
     def detailed_model_analysis(self, cv_folds=10):
-        """在10折CV中，收集所有折的预测，输出整体Classification Report和Confusion Matrix"""
-        print(f"\n🔍 详细模型分析 (聚合10折结果)…")
-        target = 'Stage_encoded' if 'Stage_encoded' in self.df else 'Label'
+        """详细分析最佳模型：聚合10折CV的预测结果"""
+        print(f"\n🔍 详细模型分析 (聚合{cv_folds}折结果)")
+
+        target = 'Stage_encoded' if 'Stage_encoded' in self.df.columns else 'Label'
         X = self.df[self.selected_features]
         y = self.df[target]
 
-        # 只选表现最好的模型
-        best = max(self.cv_results,
-                   key=lambda nm: self.cv_results[nm]['f1_macro'][0])
-        print(f"🏆 最佳模型: {best}")
+        # 找出最佳模型
+        best_model = max(self.cv_results.keys(),
+                        key=lambda x: self.cv_results[x]['f1_macro']['mean'])
+        print(f"🏆 分析最佳模型: {best_model}")
 
-        # 重建好管道
-        if best in ('MLP', 'SVM'):
-            pipe = Pipeline([
-                ('scaler', StandardScaler()),
-                ('clf', {
-                    'MLP': self.models_performance['MLP'],
-                    'SVM': self.models_performance['SVM']
-                }[best])
-            ])
-        else:
-            pipe = RandomForestClassifier(
-                n_estimators=200, class_weight='balanced',
-                random_state=42, n_jobs=-1)
+        # 重建最佳模型
+        if best_model == 'RandomForest':
+            clf = RandomForestClassifier(
+                n_estimators=300,
+                class_weight='balanced',
+                random_state=42,
+                n_jobs=-1
+            )
+            estimator = clf
+        elif best_model == 'MLP':
+            clf = MLPClassifier(
+                hidden_layer_sizes=(100,),
+                max_iter=1000,
+                early_stopping=True,
+                learning_rate_init=1e-3,
+                random_state=42
+            )
+            estimator = Pipeline([('scaler', StandardScaler()), ('clf', clf)])
+        else:  # SVM
+            clf = SVC(kernel='rbf', C=1.0, random_state=42)
+            estimator = Pipeline([('scaler', StandardScaler()), ('clf', clf)])
 
+        # 10折交叉验证，收集所有预测
         skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
         y_true_all, y_pred_all = [], []
 
-        for tr, te in skf.split(X, y):
-            pipe.fit(X.iloc[tr], y.iloc[tr])
-            y_pred = pipe.predict(X.iloc[te])
-            y_true_all.append(y.iloc[te].values)
-            y_pred_all.append(y_pred)
+        print("🔄 执行10折交叉验证...")
+        for fold, (train_idx, test_idx) in enumerate(skf.split(X, y), 1):
+            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
 
-        y_true = np.concatenate(y_true_all)
-        y_pred = np.concatenate(y_pred_all)
+            # 训练和预测
+            estimator.fit(X_train, y_train)
+            y_pred = estimator.predict(X_test)
 
-        print("\n--- Aggregated Classification Report ---")
+            y_true_all.extend(y_test.values)
+            y_pred_all.extend(y_pred)
+
+            print(f"  折 {fold:2d} 完成")
+
+        # 聚合结果
+        y_true = np.array(y_true_all)
+        y_pred = np.array(y_pred_all)
+
+        # 计算整体指标
+        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+
+        accuracy = accuracy_score(y_true, y_pred)
+        precision = precision_score(y_true, y_pred, average='macro')
+        recall = recall_score(y_true, y_pred, average='macro')
+        f1 = f1_score(y_true, y_pred, average='macro')
+
+        print(f"\n📊 聚合结果 ({best_model}):")
+        print(f"  准确率 (Accuracy): {accuracy:.4f}")
+        print(f"  精确率 (Precision): {precision:.4f}")
+        print(f"  召回率 (Recall): {recall:.4f}")
+        print(f"  F1分数 (F1-Score): {f1:.4f}")
+
+        print(f"\n📋 详细分类报告:")
         print(classification_report(y_true, y_pred))
-        print("--- Aggregated Confusion Matrix ---")
+
+        print(f"\n📊 混淆矩阵:")
         print(confusion_matrix(y_true, y_pred))
+
+        # 保存详细结果
+        self.models_performance = {
+            'best_model': best_model,
+            'aggregated_metrics': {
+                'accuracy': accuracy,
+                'precision_macro': precision,
+                'recall_macro': recall,
+                'f1_macro': f1
+            },
+            'classification_report': classification_report(y_true, y_pred, output_dict=True),
+            'confusion_matrix': confusion_matrix(y_true, y_pred).tolist()
+        }
+
         return self
 
     def save_results(self):
@@ -426,15 +602,14 @@ class EnhancedAPTPreprocessor:
         start_time = time.time()
 
         try:
-            # 执行完整流程
+            # 执行完整流程（按论文方法修正）
             (self
              .load_data()
              .clean_data()
              .create_statistical_features()
              .encode_and_normalize()
-             .select_features_with_rf_cv(n_features=n_features, cv_folds=cv_folds)
-             .evaluate_multiple_models(cv_folds=cv_folds)
-             .detailed_model_analysis()
+             .prepare_paper_aligned_features()
+             .evaluate_with_fold_internal_pipeline(n_features=n_features, cv_folds=cv_folds)
              .save_results())
 
             total_time = time.time() - start_time
@@ -446,16 +621,45 @@ class EnhancedAPTPreprocessor:
 
             # 打印最终结果摘要
             if self.cv_results:
-                print(f"\n📈 最终模型性能摘要 ({cv_folds}折交叉验证):")
+                print(f"\n📈 论文方法模型性能摘要 ({cv_folds}折交叉验证):")
                 for model_name, metrics in self.cv_results.items():
-                    print(f"  {model_name}: F1={metrics['f1_mean']:.4f}±{metrics['f1_std']:.3f}")
+                    f1_mean = metrics['f1_macro']['mean']
+                    f1_std = metrics['f1_macro']['std']
+                    print(f"  {model_name}: F1={f1_mean:.4f}±{f1_std:.3f}")
 
             # 打印特征选择摘要
-            if hasattr(self, 'feature_importance'):
-                print(f"\n🎯 特征选择摘要:")
-                high_freq = (self.feature_importance['selection_frequency'] >= 0.8).sum()
-                print(f"  高稳定性特征 (≥80%): {high_freq}/{n_features}")
-                print(f"  平均重要性: {self.feature_importance.head(n_features)['importance_mean'].mean():.6f}")
+            if hasattr(self, 'candidate_features'):
+                print(f"\n🎯 论文对齐特征摘要:")
+                print(f"  候选特征数量: {len(self.candidate_features)}")
+
+                # 检查时间特征
+                time_features = ['hour', 'minute', 'day_of_week']
+                time_in_candidates = [f for f in self.candidate_features if f in time_features]
+                print(f"  包含时间特征: {time_in_candidates}")
+
+                # 检查是否排除了Activity
+                activity_excluded = not any('activity' in f.lower() for f in self.candidate_features)
+                print(f"  已排除Activity标签: {'✅' if activity_excluded else '❌'}")
+
+                # 显示特征类型分布
+                network_features = len([f for f in self.candidate_features if f not in time_features + ['Protocol_encoded']])
+                print(f"  网络流特征: {network_features}")
+                print(f"  时间特征: {len(time_in_candidates)}")
+                print(f"  协议特征: {1 if 'Protocol_encoded' in self.candidate_features else 0}")
+
+            # 与论文结果对比
+            if self.cv_results:
+                best_f1 = max(metrics['f1_macro']['mean'] for metrics in self.cv_results.values())
+                print(f"\n🎯 与论文对比:")
+                print(f"  我们的最佳F1: {best_f1:.4f}")
+                print(f"  论文报告F1: ~0.9800")
+                print(f"  差距: {0.98 - best_f1:.4f}")
+                if best_f1 >= 0.97:
+                    print(f"  ✅ 接近论文水平！")
+                elif best_f1 >= 0.95:
+                    print(f"  🔶 良好水平，可进一步优化")
+                else:
+                    print(f"  ⚠️ 需要进一步调优")
 
         except Exception as e:
             print(f"❌ 处理过程中出现错误: {e}")
