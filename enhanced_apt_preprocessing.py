@@ -14,6 +14,7 @@ import struct
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
 from sklearn.neural_network import MLPClassifier
+import xgboost as xgb
 import warnings
 import os
 import time
@@ -237,12 +238,6 @@ class EnhancedAPTPreprocessor:
         return self
 
     def prepare_paper_aligned_features(self):
-        """
-        构造候选特征池 = 85个CICFlowMeter原始数值字段 + 时间拆分
-        自动排除：
-          - Label/Label_encoded/Stage/Stage_encoded/Activity*
-          - 用户在脚本里后续产生的衍生字段 (含 '_encoded', '_log', 'per_sec', 'bulk', 'ratio')
-        """
         # 1) 自动识别“唯一”目标列
         for col in ('Label_encoded', 'Label', 'Stage_encoded', 'Stage'):
             if col in self.df.columns:
@@ -271,7 +266,7 @@ class EnhancedAPTPreprocessor:
             if tf in self.df.columns and tf not in feature_cols:
                 feature_cols.append(tf)
 
-        # 检查论文中的7个关键缺失特征
+        # 检查论文中的关键特征（包含新增的3个重要特征）
         paper_critical_features = [
             'Protocol_encoded',  # 协议特征（TCP/UDP）
             'Flow Duration',     # 流持续时间
@@ -285,7 +280,11 @@ class EnhancedAPTPreprocessor:
             'RST Flag Count',    # RST标志位计数
             'PSH Flag Count',    # PSH标志位计数
             'ACK Flag Count',    # ACK标志位计数
-            'URG Flag Count'     # URG标志位计数
+            'URG Flag Count',    # URG标志位计数
+            # 新增的3个重要特征
+            'Total Length of Fwd Packet',  # 前向包总长度
+            'Fwd Packet Length Min',       # 前向包最小长度
+            'Flow IAT Min'                 # 流间隔最小值
         ]
 
         # 检查关键特征的存在情况
@@ -352,14 +351,15 @@ class EnhancedAPTPreprocessor:
 
         # 按论文配置模型（优化超参数）
         models = {
-            'RandomForest': RandomForestClassifier(
-                n_estimators=500,  # 增加树的数量
-                max_depth=20,      # 限制深度防止过拟合
-                min_samples_split=5,
-                min_samples_leaf=2,
-                class_weight='balanced',
+            'XGBoost': xgb.XGBClassifier(
+                n_estimators=300,
+                max_depth=6,
+                learning_rate=0.1,
+                subsample=0.8,
+                colsample_bytree=0.8,
                 random_state=42,
-                n_jobs=-1
+                n_jobs=-1,
+                eval_metric='mlogloss'
             ),
             'MLP': MLPClassifier(
                 hidden_layer_sizes=(150, 100, 50),  # 更深的网络结构
@@ -387,11 +387,11 @@ class EnhancedAPTPreprocessor:
             print(f"\n🚀 评估模型: {name}")
 
             # 构建折内Pipeline：特征选择 → 标准化 → 分类器
-            if name == 'RandomForest':
-                # RF不需要标准化，但需要特征选择
+            if name == 'XGBoost':
+                # XGBoost不需要标准化，但需要特征选择
                 pipeline = Pipeline([
                     ('feat_sel', SelectFromModel(
-                        RandomForestClassifier(n_estimators=100, random_state=42),
+                        xgb.XGBClassifier(n_estimators=100, random_state=42, eval_metric='mlogloss'),
                         threshold=-np.inf,
                         max_features=n_features,
                         importance_getter='feature_importances_'
@@ -402,7 +402,7 @@ class EnhancedAPTPreprocessor:
                 # MLP和SVM需要特征选择+标准化
                 pipeline = Pipeline([
                     ('feat_sel', SelectFromModel(
-                        RandomForestClassifier(n_estimators=100, random_state=42),
+                        xgb.XGBClassifier(n_estimators=100, random_state=42, eval_metric='mlogloss'),
                         threshold=-np.inf,
                         max_features=n_features,
                         importance_getter='feature_importances_'
@@ -837,11 +837,273 @@ class EnhancedAPTPreprocessor:
 
         return self
 
+    def build_attack_sequences(self, num_apt_sequences=1000, min_normal_insert=1, max_normal_insert=5):
+        """构建攻击序列，参考dapt_preprocessing.py的方法"""
+        print(f"\n🔗 构建攻击序列 (生成{num_apt_sequences}个APT序列)")
+
+        # 确定目标变量
+        target = 'Stage_encoded' if 'Stage_encoded' in self.df.columns else 'Label'
+
+        # 构建attack2id映射
+        self._build_attack2id_mapping()
+
+        # 按攻击阶段分组数据
+        self._partition_data_by_stage(target)
+
+        # 构建APT序列标签
+        self._build_apt_sequence_labels(num_apt_sequences, min_normal_insert, max_normal_insert)
+
+        # 构建正常序列标签
+        self._build_normal_sequence_labels()
+
+        # 为序列选择实际数据样本
+        self._select_samples_for_sequences()
+
+        # 转换标签序列为ID序列
+        self._convert_labels_to_ids()
+
+        # 分配最终序列标签
+        self._assign_final_sequence_labels()
+
+        # 保存序列数据
+        self._save_sequence_results()
+
+        print(f"✅ 攻击序列构建完成")
+        print(f"  APT序列数量: {len(self.apt_sequences_data)}")
+        print(f"  正常序列数量: {len(self.normal_sequences_data)}")
+        print(f"  Attack2ID映射: {self.attack2id}")
+
+        return self
+
+    def _build_attack2id_mapping(self):
+        """构建attack2id映射"""
+        print("构建attack2id映射...")
+
+        # 基于Stage_encoded的值构建映射
+        target = 'Stage_encoded' if 'Stage_encoded' in self.df.columns else 'Label'
+        unique_stages = sorted(self.df[target].unique())
+
+        # 创建内部标签映射
+        self.stage_to_internal = {
+            0: 'SN',  # 正常流量
+            1: 'S1',  # 数据渗透
+            2: 'S2',  # 建立立足点
+            3: 'S3',  # 横向移动
+            4: 'S4'   # 侦察
+        }
+
+        # 构建attack2id映射
+        self.attack2id = {
+            'SN': 0,  # 正常流量
+            'S1': 1,  # 数据渗透
+            'S2': 2,  # 建立立足点
+            'S3': 3,  # 横向移动
+            'S4': 4   # 侦察
+        }
+
+        print(f"  Attack2ID映射: {self.attack2id}")
+
+    def _partition_data_by_stage(self, target):
+        """按攻击阶段分组数据"""
+        print("按攻击阶段分组数据...")
+
+        self.stage_dataframes = {}
+
+        for stage_encoded, internal_label in self.stage_to_internal.items():
+            stage_data = self.df[self.df[target] == stage_encoded]
+            if not stage_data.empty:
+                # 只保留选择的特征
+                if hasattr(self, 'candidate_features'):
+                    stage_data = stage_data[self.candidate_features]
+                self.stage_dataframes[internal_label] = stage_data
+                print(f"  {internal_label}: {len(stage_data)} 样本")
+            else:
+                print(f"  {internal_label}: 0 样本 (跳过)")
+
+    def _build_apt_sequence_labels(self, num_apt_sequences, min_normal_insert, max_normal_insert):
+        """构建APT序列标签"""
+        print("构建APT序列标签...")
+
+        import random
+        random.seed(42)
+
+        # 可用的攻击阶段（按顺序）
+        available_attack_stages = ['S1', 'S2', 'S3', 'S4']
+        normal_stage = 'SN'
+
+        # 序列类型数量（1-4个攻击阶段）
+        num_sequence_types = len(available_attack_stages)
+        num_per_type = num_apt_sequences // num_sequence_types
+        remainder = num_apt_sequences % num_sequence_types
+
+        self.apt_sequences_labels = []
+
+        for i in range(num_sequence_types):
+            # 定义当前序列类型的基础攻击阶段
+            current_base_stages = available_attack_stages[:i+1]
+            print(f"  生成类型{i+1} (最大阶段: {current_base_stages[-1]}): {current_base_stages}")
+
+            num_for_this_type = num_per_type + (1 if i < remainder else 0)
+
+            for _ in range(num_for_this_type):
+                # 基础序列
+                current_seq = list(current_base_stages)
+
+                # 插入随机数量的正常流量
+                num_sn_to_insert = random.randint(min_normal_insert, max_normal_insert)
+                for _ in range(num_sn_to_insert):
+                    insert_pos = random.randint(0, len(current_seq))
+                    current_seq.insert(insert_pos, normal_stage)
+
+                self.apt_sequences_labels.append(current_seq)
+
+        print(f"  构建了{len(self.apt_sequences_labels)}个APT序列标签")
+
+    def _build_normal_sequence_labels(self):
+        """构建正常序列标签"""
+        print("构建正常序列标签...")
+
+        self.normal_sequences_labels = []
+
+        # 为每个APT序列生成对应长度的正常序列
+        for apt_seq in self.apt_sequences_labels:
+            normal_len = len(apt_seq)
+            self.normal_sequences_labels.append(['SN'] * normal_len)
+
+        print(f"  构建了{len(self.normal_sequences_labels)}个正常序列标签")
+
+    def _select_samples_for_sequences(self):
+        """为序列选择实际数据样本"""
+        print("为序列选择实际数据样本...")
+
+        import random
+        random.seed(42)
+
+        self.apt_sequences_data = []
+        self.normal_sequences_data = []
+
+        # 为APT序列选择样本
+        for seq_labels in self.apt_sequences_labels:
+            sequence_data = []
+            for stage_label in seq_labels:
+                if stage_label in self.stage_dataframes:
+                    stage_df = self.stage_dataframes[stage_label]
+                    if not stage_df.empty:
+                        # 随机选择一个样本
+                        sample = stage_df.sample(1).iloc[0].to_dict()
+                        sequence_data.append(sample)
+                    else:
+                        print(f"    警告: {stage_label} 阶段数据为空")
+                else:
+                    print(f"    警告: 找不到 {stage_label} 阶段数据")
+
+            if sequence_data:  # 只添加非空序列
+                self.apt_sequences_data.append(sequence_data)
+
+        # 为正常序列选择样本
+        for seq_labels in self.normal_sequences_labels:
+            sequence_data = []
+            for stage_label in seq_labels:  # 都是'SN'
+                if stage_label in self.stage_dataframes:
+                    stage_df = self.stage_dataframes[stage_label]
+                    if not stage_df.empty:
+                        sample = stage_df.sample(1).iloc[0].to_dict()
+                        sequence_data.append(sample)
+
+            if sequence_data:
+                self.normal_sequences_data.append(sequence_data)
+
+        print(f"  APT序列数据: {len(self.apt_sequences_data)}")
+        print(f"  正常序列数据: {len(self.normal_sequences_data)}")
+
+    def _convert_labels_to_ids(self):
+        """转换标签序列为ID序列"""
+        print("转换标签序列为ID序列...")
+
+        try:
+            self.apt_sequences_ids = [[self.attack2id[label] for label in seq] for seq in self.apt_sequences_labels]
+            self.normal_sequences_ids = [[self.attack2id[label] for label in seq] for seq in self.normal_sequences_labels]
+            print(f"  APT序列ID: {len(self.apt_sequences_ids)}")
+            print(f"  正常序列ID: {len(self.normal_sequences_ids)}")
+        except KeyError as e:
+            print(f"错误: 标签 {e} 不在attack2id映射中")
+            raise
+
+    def _assign_final_sequence_labels(self):
+        """分配最终序列标签"""
+        print("分配最终序列标签...")
+
+        # APT序列标签基于最高攻击阶段
+        stage_to_final_label = {'S1': 1, 'S2': 2, 'S3': 3, 'S4': 4, 'SN': 0}
+
+        self.apt_labels = []
+        for seq_labels in self.apt_sequences_labels:
+            max_stage_num = 0
+            for label in seq_labels:
+                stage_num = stage_to_final_label.get(label, 0)
+                max_stage_num = max(max_stage_num, stage_num)
+            self.apt_labels.append(max_stage_num if max_stage_num > 0 else 1)
+
+        # 正常序列标签都是0
+        self.normal_labels = [0] * len(self.normal_sequences_ids)
+
+        print(f"  APT标签: {len(self.apt_labels)}")
+        print(f"  正常标签: {len(self.normal_labels)}")
+
+    def _save_sequence_results(self):
+        """保存序列结果"""
+        print("保存序列结果...")
+
+        # 保存attack2id映射
+        attack2id_path = os.path.join(self.output_path, 'attack2id.json')
+        with open(attack2id_path, 'w') as f:
+            json.dump(self.attack2id, f, indent=4)
+        print(f"  Attack2ID映射保存至: {attack2id_path}")
+
+        # 保存APT序列数据
+        apt_data_path = os.path.join(self.output_path, 'apt_sequences_data.json')
+        with open(apt_data_path, 'w') as f:
+            # 转换numpy类型为Python类型
+            serializable_apt_data = [
+                [{k: (v.item() if hasattr(v, 'item') else v) for k, v in step.items()} for step in seq]
+                for seq in self.apt_sequences_data
+            ]
+            json.dump(serializable_apt_data, f, indent=2)
+        print(f"  APT序列数据保存至: {apt_data_path}")
+
+        # 保存正常序列数据
+        normal_data_path = os.path.join(self.output_path, 'normal_sequences_data.json')
+        with open(normal_data_path, 'w') as f:
+            serializable_normal_data = [
+                [{k: (v.item() if hasattr(v, 'item') else v) for k, v in step.items()} for step in seq]
+                for seq in self.normal_sequences_data
+            ]
+            json.dump(serializable_normal_data, f, indent=2)
+        print(f"  正常序列数据保存至: {normal_data_path}")
+
+        # 保存序列标签
+        apt_labels_path = os.path.join(self.output_path, 'apt_labels.npy')
+        np.save(apt_labels_path, np.array(self.apt_labels))
+        print(f"  APT标签保存至: {apt_labels_path}")
+
+        normal_labels_path = os.path.join(self.output_path, 'normal_labels.npy')
+        np.save(normal_labels_path, np.array(self.normal_labels))
+        print(f"  正常标签保存至: {normal_labels_path}")
+
+        # 保存序列ID
+        apt_ids_path = os.path.join(self.output_path, 'apt_sequences_ids.npy')
+        np.save(apt_ids_path, np.array(self.apt_sequences_ids, dtype=object), allow_pickle=True)
+        print(f"  APT序列ID保存至: {apt_ids_path}")
+
+        normal_ids_path = os.path.join(self.output_path, 'normal_sequences_ids.npy')
+        np.save(normal_ids_path, np.array(self.normal_sequences_ids, dtype=object), allow_pickle=True)
+        print(f"  正常序列ID保存至: {normal_ids_path}")
+
 
 def main():
     """主函数"""
     print("🎯 增强版APT数据预处理器")
-    print("特点: 丰富统计量 + 时间特征 + 随机森林特征选择 + 多模型评估")
+    print("特点: XGBoost特征选择 + 论文关键特征 + 攻击序列构建")
     print("="*80)
 
     # 设置路径
@@ -850,7 +1112,12 @@ def main():
 
     # 创建处理器并运行
     processor = EnhancedAPTPreprocessor(input_path, output_path)
-    processor.run_complete_pipeline(n_features=46, cv_folds=10)
+
+    # 运行完整的预处理和评估流程（调整特征数量为可用特征数）
+    processor.run_complete_pipeline(n_features=20, cv_folds=10)
+
+    # 构建攻击序列
+    processor.build_attack_sequences(num_apt_sequences=10000, min_normal_insert=1, max_normal_insert=5)
 
 
 if __name__ == "__main__":
