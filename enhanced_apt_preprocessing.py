@@ -132,14 +132,10 @@ class EnhancedAPTPreprocessor:
             self.df['day_of_week'] = self.df['datetime'].dt.dayofweek  # 0=Monday
 
             print("✅ 提取时间特征: hour, minute, second, day_of_week")
+        except:
+            return 0
 
-            # 删除原始时间戳和临时datetime列
-            self.df.drop(columns=['Timestamp', 'datetime'], inplace=True, errors='ignore')
 
-        except Exception as e:
-            print(f"⚠️ 时间戳处理失败: {e}")
-            # 如果处理失败，删除时间戳列
-            self.df.drop(columns=['Timestamp'], inplace=True, errors='ignore')
 
     def create_statistical_features(self):
         """创建流量统计量特征（基于每条流）"""
@@ -241,47 +237,102 @@ class EnhancedAPTPreprocessor:
         return self
 
     def prepare_paper_aligned_features(self):
-        """按论文方法准备特征：只用网络流特征+时间特征，排除Activity等标签信息"""
-        print(f"\n🎯 按论文方法准备特征（排除Activity等标签信息）")
-
-        # 确定目标变量
-        if 'Stage_encoded' in self.df.columns:
-            target = 'Stage_encoded'
-        elif 'Label' in self.df.columns:
-            target = 'Label'
+        """
+        构造候选特征池 = 85个CICFlowMeter原始数值字段 + 时间拆分
+        自动排除：
+          - Label/Label_encoded/Stage/Stage_encoded/Activity*
+          - 用户在脚本里后续产生的衍生字段 (含 '_encoded', '_log', 'per_sec', 'bulk', 'ratio')
+        """
+        # 1) 自动识别“唯一”目标列
+        for col in ('Label_encoded', 'Label', 'Stage_encoded', 'Stage'):
+            if col in self.df.columns:
+                target = col
+                break
         else:
-            raise ValueError("找不到目标变量列")
+            raise ValueError("找不到目标列：Label/Label_encoded/Stage/Stage_encoded")
 
-        # 获取所有数值特征
-        numeric_cols = self.df.select_dtypes(include=[np.number]).columns.tolist()
+        # 2) 取所有数值型列
+        numeric_cols = self.df.select_dtypes(include=[int, float]).columns.tolist()
 
-        # 排除目标变量和Activity相关的编码列（避免标签泄露）
-        exclude_cols = [target, 'Activity_encoded', 'Stage_encoded']
-        if target == 'Stage_encoded':
-            exclude_cols.remove('Stage_encoded')  # 如果Stage_encoded是目标，就不排除它
+        # 3) 构造排除模式：标签、Activity + 后续衍生
+        exclude = {target, 'Activity', 'Activity_encoded'}
+        # 排除所有名称中含以下关键字的列
+        bad_kw = ('_encoded', '_log', 'per_sec', 'bulk', 'ratio')
+        for c in numeric_cols:
+            low = c.lower()
+            if any(kw in low for kw in bad_kw):
+                exclude.add(c)
 
-        feature_cols = [col for col in numeric_cols if col not in exclude_cols]
+        # 4) 最终的候选池 = numeric_cols - exclude
+        feature_cols = [c for c in numeric_cols if c not in exclude]
 
-        # 确保时间特征被包含（论文Table 3中的关键特征）
-        time_features = ['hour', 'minute', 'day_of_week']  # 移除second，按论文只用这3个
-        for tf in time_features:
+        # 5) 补充时间拆分（若存在的话）
+        for tf in ('hour', 'minute', 'second', 'day_of_week'):
             if tf in self.df.columns and tf not in feature_cols:
                 feature_cols.append(tf)
 
-        # 确保Protocol编码被包含（网络特征的一部分）
-        if 'Protocol_encoded' in self.df.columns and 'Protocol_encoded' not in feature_cols:
-            feature_cols.append('Protocol_encoded')
+        # 检查论文中的7个关键缺失特征
+        paper_critical_features = [
+            'Protocol_encoded',  # 协议特征（TCP/UDP）
+            'Flow Duration',     # 流持续时间
+            'Fwd IAT Total',     # 正向IAT总时间
+            'Fwd IAT Mean',      # 正向IAT平均时间
+            'Bwd IAT Std',       # 反向IAT标准差
+            'Bwd IAT Max',       # 反向IAT最大值
+            'Bwd IAT Min',       # 反向IAT最小值
+            'FIN Flag Count',    # FIN标志位计数
+            'SYN Flag Count',    # SYN标志位计数
+            'RST Flag Count',    # RST标志位计数
+            'PSH Flag Count',    # PSH标志位计数
+            'ACK Flag Count',    # ACK标志位计数
+            'URG Flag Count'     # URG标志位计数
+        ]
 
-        print(f"网络流特征数量: {len([f for f in feature_cols if f not in time_features + ['Protocol_encoded']])}")
-        print(f"时间特征数量: {len([f for f in feature_cols if f in time_features])}")
-        print(f"协议特征数量: {len([f for f in feature_cols if f == 'Protocol_encoded'])}")
-        print(f"候选特征总数: {len(feature_cols)}")
+        # 检查关键特征的存在情况
+        critical_found = []
+        critical_missing = []
 
-        # 检查是否意外包含了Activity
-        activity_features = [f for f in feature_cols if 'activity' in f.lower()]
-        if activity_features:
-            print(f"⚠️ 警告：发现Activity相关特征，将被移除: {activity_features}")
-            feature_cols = [f for f in feature_cols if f not in activity_features]
+        for feat in paper_critical_features:
+            if feat in self.df.columns:
+                if feat not in feature_cols:
+                    feature_cols.append(feat)  # 确保关键特征被包含
+                critical_found.append(feat)
+            else:
+                critical_missing.append(feat)
+
+        # 打印确认
+        print(f"✅ 目标列（已排除）: {target}")
+        print(f"✅ 排除了 {len(exclude)} 列，候选池共有 {len(feature_cols)} 列")
+        print("候选特征示例:", feature_cols[:10], "...")
+
+        # 详细分析论文关键特征
+        print(f"\n📊 论文关键特征检查:")
+        print(f"  论文关键特征找到: {len(critical_found)}/13")
+
+        if critical_found:
+            print(f"\n✅ 找到的论文关键特征:")
+            for i, feat in enumerate(critical_found, 1):
+                print(f"  {i:2d}. {feat}")
+
+        if critical_missing:
+            print(f"\n❌ 缺失的论文关键特征:")
+            for i, feat in enumerate(critical_missing, 1):
+                print(f"  {i:2d}. {feat}")
+
+        # 检查特征类别分布
+        protocol_features = [f for f in feature_cols if 'protocol' in f.lower()]
+        duration_features = [f for f in feature_cols if 'duration' in f.lower()]
+        iat_features = [f for f in feature_cols if 'iat' in f.lower()]
+        flag_features = [f for f in feature_cols if 'flag' in f.lower()]
+        time_features = ['hour', 'minute', 'day_of_week']
+        time_in_candidates = [f for f in feature_cols if f in time_features]
+
+        print(f"\n🔍 特征类别分布:")
+        print(f"  协议特征: {len(protocol_features)} ({protocol_features})")
+        print(f"  流持续时间: {len(duration_features)} ({duration_features})")
+        print(f"  IAT时间间隔: {len(iat_features)}")
+        print(f"  TCP标志位: {len(flag_features)}")
+        print(f"  时间特征: {len(time_in_candidates)} ({time_in_candidates})")
 
         self.candidate_features = feature_cols
         return self
@@ -299,24 +350,30 @@ class EnhancedAPTPreprocessor:
         print(f"样本数量: {X.shape[0]}")
         print(f"类别分布: {dict(y.value_counts().sort_index())}")
 
-        # 按论文配置模型
+        # 按论文配置模型（优化超参数）
         models = {
             'RandomForest': RandomForestClassifier(
-                n_estimators=300,
+                n_estimators=500,  # 增加树的数量
+                max_depth=20,      # 限制深度防止过拟合
+                min_samples_split=5,
+                min_samples_leaf=2,
                 class_weight='balanced',
                 random_state=42,
                 n_jobs=-1
             ),
             'MLP': MLPClassifier(
-                hidden_layer_sizes=(100,),
-                max_iter=1000,
+                hidden_layer_sizes=(150, 100, 50),  # 更深的网络结构
+                max_iter=2000,     # 增加迭代次数
                 early_stopping=True,
+                validation_fraction=0.1,
                 learning_rate_init=1e-3,
+                alpha=0.001,       # L2正则化
                 random_state=42
             ),
             'SVM': SVC(
                 kernel='rbf',
-                C=1.0,
+                C=10.0,           # 优化C参数
+                gamma='scale',    # 自动调整gamma
                 random_state=42
             )
         }
@@ -335,7 +392,9 @@ class EnhancedAPTPreprocessor:
                 pipeline = Pipeline([
                     ('feat_sel', SelectFromModel(
                         RandomForestClassifier(n_estimators=100, random_state=42),
-                        max_features=n_features
+                        threshold=-np.inf,
+                        max_features=n_features,
+                        importance_getter='feature_importances_'
                     )),
                     ('clf', clf)
                 ])
@@ -344,7 +403,9 @@ class EnhancedAPTPreprocessor:
                 pipeline = Pipeline([
                     ('feat_sel', SelectFromModel(
                         RandomForestClassifier(n_estimators=100, random_state=42),
-                        max_features=n_features
+                        threshold=-np.inf,
+                        max_features=n_features,
+                        importance_getter='feature_importances_'
                     )),
                     ('scaler', StandardScaler()),
                     ('clf', clf)
@@ -356,8 +417,15 @@ class EnhancedAPTPreprocessor:
                 cv=skf,
                 scoring=scoring,
                 n_jobs=-1,
-                return_train_score=False
+                return_train_score=False,
+                return_estimator = True
             )
+            for fold_idx, est in enumerate(cv_results['estimator'], 1):
+                # feat_sel 是 SelectFromModel 这一步
+                mask = est.named_steps['feat_sel'].get_support()
+                selected_feats = X.columns[mask].tolist()
+                print(f"Fold {fold_idx} 选出的 {len(selected_feats)} 个特征：")
+                print(selected_feats)
 
             # 计算统计量
             results = {}
@@ -540,6 +608,9 @@ class EnhancedAPTPreprocessor:
         print(f"\n📊 混淆矩阵:")
         print(confusion_matrix(y_true, y_pred))
 
+        # 添加每个攻击阶段的详细分析
+        self._analyze_per_stage_performance(y_true, y_pred)
+
         # 保存详细结果
         self.models_performance = {
             'best_model': best_model,
@@ -554,6 +625,97 @@ class EnhancedAPTPreprocessor:
         }
 
         return self
+
+    def _analyze_per_stage_performance(self, y_true, y_pred):
+        """分析每个APT攻击阶段的检测性能"""
+        print(f"\n🎯 每个APT攻击阶段的检测性能分析:")
+        print("="*60)
+
+        # 定义阶段映射
+        stage_names = {
+            0: 'Benign (正常流量)',
+            4: 'Data Exfiltration (数据渗透)',
+            2: 'Establish Foothold (建立立足点)',
+            3: 'Lateral Movement (横向移动)',
+            1: 'Reconnaissance (侦察)'
+        }
+
+        # 计算每个类别的详细指标
+        from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
+
+        precision, recall, f1, support = precision_recall_fscore_support(
+            y_true, y_pred, average=None, zero_division=0
+        )
+
+        # 混淆矩阵
+        cm = confusion_matrix(y_true, y_pred)
+
+        print(f"{'阶段':<25} {'精确率':<10} {'召回率':<10} {'F1分数':<10} {'样本数':<8} {'检测率':<10}")
+        print("-" * 80)
+
+        total_correct = 0
+        total_samples = 0
+
+        for i, (stage_id, stage_name) in enumerate(stage_names.items()):
+            if i < len(precision):
+                # 计算检测率 (该阶段被正确识别的比例)
+                detection_rate = cm[i, i] / support[i] if support[i] > 0 else 0
+
+                print(f"{stage_name:<25} {precision[i]:<10.4f} {recall[i]:<10.4f} "
+                      f"{f1[i]:<10.4f} {support[i]:<8d} {detection_rate:<10.4f}")
+
+                total_correct += cm[i, i]
+                total_samples += support[i]
+
+        print("-" * 80)
+        overall_accuracy = total_correct / total_samples if total_samples > 0 else 0
+        print(f"{'总体准确率':<25} {'':<10} {'':<10} {'':<10} {total_samples:<8d} {overall_accuracy:<10.4f}")
+
+        # 分析攻击阶段间的混淆情况
+        print(f"\n🔍 攻击阶段间混淆分析:")
+        print("="*50)
+
+        for i, (true_stage_id, true_stage_name) in enumerate(stage_names.items()):
+            if i < len(cm):
+                print(f"\n真实阶段: {true_stage_name}")
+                for j, (pred_stage_id, pred_stage_name) in enumerate(stage_names.items()):
+                    if j < len(cm[i]) and cm[i, j] > 0:
+                        confusion_rate = cm[i, j] / support[i] if support[i] > 0 else 0
+                        if i != j:  # 只显示错误分类
+                            print(f"  → 误分类为 {pred_stage_name}: {cm[i, j]} 样本 ({confusion_rate:.3f})")
+
+        # 计算宏平均指标
+        macro_precision = np.mean(precision)
+        macro_recall = np.mean(recall)
+        macro_f1 = np.mean(f1)
+
+        print(f"\n📊 宏平均性能指标:")
+        print(f"  宏平均精确率: {macro_precision:.4f}")
+        print(f"  宏平均召回率: {macro_recall:.4f}")
+        print(f"  宏平均F1分数: {macro_f1:.4f}")
+
+        # 识别表现最好和最差的阶段
+        best_stage_idx = np.argmax(f1)
+        worst_stage_idx = np.argmin(f1)
+
+        print(f"\n🏆 性能分析:")
+        print(f"  最佳检测阶段: {list(stage_names.values())[best_stage_idx]} (F1: {f1[best_stage_idx]:.4f})")
+        print(f"  最差检测阶段: {list(stage_names.values())[worst_stage_idx]} (F1: {f1[worst_stage_idx]:.4f})")
+
+        # 保存每阶段性能
+        self.per_stage_performance = {
+            'stage_names': stage_names,
+            'precision': precision.tolist(),
+            'recall': recall.tolist(),
+            'f1_score': f1.tolist(),
+            'support': support.tolist(),
+            'confusion_matrix': cm.tolist(),
+            'macro_avg': {
+                'precision': macro_precision,
+                'recall': macro_recall,
+                'f1_score': macro_f1
+            }
+        }
 
     def save_results(self):
         """保存所有结果"""
@@ -591,6 +753,13 @@ class EnhancedAPTPreprocessor:
             with open(models_path, 'w') as f:
                 json.dump(self.models_performance, f, indent=4)
             print(f"✅ 模型性能结果保存至: {models_path}")
+
+        # 保存每阶段性能分析
+        if hasattr(self, 'per_stage_performance'):
+            stage_path = os.path.join(self.output_path, 'per_stage_performance.json')
+            with open(stage_path, 'w') as f:
+                json.dump(self.per_stage_performance, f, indent=4)
+            print(f"✅ 每阶段性能分析保存至: {stage_path}")
 
         return self
 
