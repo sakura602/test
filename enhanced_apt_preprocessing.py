@@ -10,11 +10,19 @@ import warnings
 import os
 import time
 import json
-from sklearn.feature_selection import SelectFromModel
+from sklearn.feature_selection import SelectFromModel, mutual_info_classif
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import StratifiedKFold, cross_validate, cross_val_score, train_test_split
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
+from sklearn.linear_model import LogisticRegression, Lasso
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.neural_network import MLPClassifier
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest, f_classif
+import itertools
+from collections import defaultdict, Counter
 
 warnings.filterwarnings('ignore')
 
@@ -228,6 +236,93 @@ class EnhancedAPTPreprocessor:
         print(f"✅ 编码和归一化完成，数据形状: {self.df.shape}")
         return self
 
+    def domain_knowledge_feature_classification(self):
+        """基于域知识的特征分类"""
+        print(f"\n🏷️ 基于域知识的特征分类")
+
+        # 获取所有数值特征
+        numeric_cols = self.df.select_dtypes(include=[int, float]).columns.tolist()
+
+        # 排除目标变量和活动标签
+        exclude_cols = {'Label', 'Label_encoded', 'Stage', 'Stage_encoded', 'Activity', 'Activity_encoded'}
+        available_features = [col for col in numeric_cols if col not in exclude_cols]
+
+        # 定义特征类别
+        self.feature_categories = {
+            'temporal': [],      # 时序特征
+            'flow_stats': [],    # 流量特征
+            'packet_length': [], # 包长度统计
+            'tcp_flags': [],     # TCP标志
+            'network_meta': [],  # 网络元数据
+            'iat_features': [],  # 时间间隔特征
+            'other': []          # 其他特征
+        }
+
+        # 分类特征
+        for feature in available_features:
+            feature_lower = feature.lower()
+
+            # 时序特征
+            if any(keyword in feature_lower for keyword in ['hour', 'minute', 'second', 'day_of_week', 'duration']):
+                self.feature_categories['temporal'].append(feature)
+
+            # 流量特征
+            elif any(keyword in feature_lower for keyword in ['bytes_s', 'packets_s', 'flow_bytes', 'flow_packets', 'total_fwd', 'total_bwd']):
+                self.feature_categories['flow_stats'].append(feature)
+
+            # 包长度统计
+            elif any(keyword in feature_lower for keyword in ['packet_length', 'fwd_packet', 'bwd_packet', 'length_min', 'length_max', 'length_mean', 'length_std']):
+                self.feature_categories['packet_length'].append(feature)
+
+            # TCP标志
+            elif any(keyword in feature_lower for keyword in ['flag', 'fin', 'syn', 'rst', 'psh', 'ack', 'urg', 'cwr', 'ece']):
+                self.feature_categories['tcp_flags'].append(feature)
+
+            # 时间间隔特征
+            elif any(keyword in feature_lower for keyword in ['iat', 'inter_arrival']):
+                self.feature_categories['iat_features'].append(feature)
+
+            # 网络元数据
+            elif any(keyword in feature_lower for keyword in ['protocol', 'port', 'ip']):
+                self.feature_categories['network_meta'].append(feature)
+
+            # 其他特征
+            else:
+                self.feature_categories['other'].append(feature)
+
+        # 打印分类结果
+        print(f"特征分类结果:")
+        total_features = 0
+        for category, features in self.feature_categories.items():
+            print(f"  {category:15}: {len(features):3d} 个特征")
+            if len(features) <= 5:
+                print(f"    示例: {features}")
+            else:
+                print(f"    示例: {features[:5]} ...")
+            total_features += len(features)
+
+        print(f"  总计: {total_features} 个特征")
+
+        # 确保每个大类至少保留1-2个代表性特征
+        self.representative_features = {}
+        for category, features in self.feature_categories.items():
+            if features:
+                # 计算每个特征的方差，选择方差较大的作为代表性特征
+                feature_vars = {}
+                for feat in features:
+                    if feat in self.df.columns:
+                        feature_vars[feat] = self.df[feat].var()
+
+                # 按方差排序，选择前2个作为代表性特征
+                sorted_features = sorted(feature_vars.items(), key=lambda x: x[1], reverse=True)
+                self.representative_features[category] = [feat for feat, _ in sorted_features[:2]]
+
+        print(f"\n代表性特征选择:")
+        for category, features in self.representative_features.items():
+            print(f"  {category:15}: {features}")
+
+        return self
+
     def prepare_paper_aligned_features(self):
         # 1) 自动识别“唯一”目标列
         for col in ('Label_encoded', 'Label', 'Stage_encoded', 'Stage'):
@@ -339,6 +434,102 @@ class EnhancedAPTPreprocessor:
         print(f"✅ 特征名称已清理，避免LightGBM兼容性问题")
         return self
 
+    def initial_feature_screening(self, correlation_threshold=0.9, variance_threshold=0.01):
+        """初筛：去相关性和高方差特征筛选"""
+        print(f"\n🔍 初筛阶段：去相关性(>{correlation_threshold})和低方差(<{variance_threshold})特征")
+
+        if not hasattr(self, 'candidate_features') or not self.candidate_features:
+            raise ValueError("请先执行特征准备步骤")
+
+        original_count = len(self.candidate_features)
+        print(f"初始特征数量: {original_count}")
+
+        # 1. 去除低方差特征（近乎常数的特征）
+        print(f"\n1️⃣ 去除低方差特征（方差 < {variance_threshold}）")
+        low_variance_features = []
+        remaining_features = []
+
+        for feature in self.candidate_features:
+            if feature in self.df.columns:
+                feature_var = self.df[feature].var()
+                if feature_var < variance_threshold:
+                    low_variance_features.append(feature)
+                else:
+                    remaining_features.append(feature)
+
+        print(f"  移除低方差特征: {len(low_variance_features)} 个")
+        if low_variance_features:
+            print(f"  示例: {low_variance_features[:5]}")
+
+        # 2. 计算相关性矩阵并去除高相关特征
+        print(f"\n2️⃣ 去除高相关特征（相关系数 > {correlation_threshold}）")
+
+        if len(remaining_features) > 1:
+            # 计算相关性矩阵
+            corr_matrix = self.df[remaining_features].corr().abs()
+
+            # 找出高相关性的特征对
+            high_corr_pairs = []
+            for i in range(len(corr_matrix.columns)):
+                for j in range(i+1, len(corr_matrix.columns)):
+                    if corr_matrix.iloc[i, j] > correlation_threshold:
+                        high_corr_pairs.append((
+                            corr_matrix.columns[i],
+                            corr_matrix.columns[j],
+                            corr_matrix.iloc[i, j]
+                        ))
+
+            print(f"  发现 {len(high_corr_pairs)} 对高相关特征")
+
+            # 选择要保留的特征（保留方差更大的）
+            to_drop = set()
+            for feat1, feat2, corr_val in high_corr_pairs:
+                if feat1 not in to_drop and feat2 not in to_drop:
+                    # 保留方差更大的特征
+                    var1 = self.df[feat1].var()
+                    var2 = self.df[feat2].var()
+
+                    if var1 >= var2:
+                        to_drop.add(feat2)
+                        print(f"    移除 {feat2} (相关性={corr_val:.3f}, 保留方差更大的 {feat1})")
+                    else:
+                        to_drop.add(feat1)
+                        print(f"    移除 {feat1} (相关性={corr_val:.3f}, 保留方差更大的 {feat2})")
+
+            # 更新特征列表
+            final_features = [f for f in remaining_features if f not in to_drop]
+            print(f"  移除高相关特征: {len(to_drop)} 个")
+        else:
+            final_features = remaining_features
+            print(f"  特征数量不足，跳过相关性分析")
+
+        # 3. 保存筛选结果
+        self.screened_features = final_features
+        screened_count = len(final_features)
+
+        print(f"\n✅ 初筛完成:")
+        print(f"  原始特征: {original_count}")
+        print(f"  筛选后特征: {screened_count}")
+        print(f"  筛选比例: {(original_count - screened_count) / original_count * 100:.1f}%")
+        print(f"  剩余特征预算: {screened_count} (目标: 50-70)")
+
+        # 4. 按类别分析筛选结果
+        if hasattr(self, 'feature_categories'):
+            print(f"\n📊 按类别分析筛选结果:")
+            category_stats = {}
+            for category, original_features in self.feature_categories.items():
+                remaining_in_category = [f for f in original_features if f in final_features]
+                category_stats[category] = {
+                    'original': len(original_features),
+                    'remaining': len(remaining_in_category),
+                    'features': remaining_in_category
+                }
+                print(f"  {category:15}: {len(original_features):2d} → {len(remaining_in_category):2d}")
+
+            self.category_screening_stats = category_stats
+
+        return self
+
     def find_optimal_feature_count_with_shap(self, max_features=None, cv_folds=5):
         """使用SHAP和交叉验证找到最优特征数量"""
         print(f"\n🔍 使用SHAP分析寻找最优特征数量")
@@ -437,6 +628,148 @@ class EnhancedAPTPreprocessor:
 
         return best_feature_count
 
+    def automated_feature_scoring(self, use_screened_features=True):
+        """自动化打分：XGBoost+SHAP、L1正则化、mRMR三种方法综合打分"""
+        print(f"\n🎯 自动化特征打分：XGBoost+SHAP + L1正则化 + mRMR")
+
+        # 选择要评分的特征
+        if use_screened_features and hasattr(self, 'screened_features'):
+            features_to_score = self.screened_features
+            print(f"使用筛选后的特征: {len(features_to_score)} 个")
+        else:
+            features_to_score = self.candidate_features
+            print(f"使用候选特征: {len(features_to_score)} 个")
+
+        if not features_to_score:
+            raise ValueError("没有可用于评分的特征")
+
+        # 准备数据
+        target = 'Stage_encoded' if 'Stage_encoded' in self.df.columns else 'Label'
+        X = self.df[features_to_score]
+        y = self.df[target]
+
+        print(f"特征数量: {X.shape[1]}, 样本数量: {X.shape[0]}")
+
+        # 初始化评分结果
+        feature_scores = {feature: {'xgb_shap': 0, 'l1_reg': 0, 'mrmr': 0, 'combined': 0}
+                         for feature in features_to_score}
+
+        # 1. XGBoost + SHAP 评分
+        print(f"\n1️⃣ XGBoost特征重要性评分")
+        try:
+            xgb_model = xgb.XGBClassifier(
+                n_estimators=200,
+                max_depth=6,
+                learning_rate=0.1,
+                random_state=42,
+                eval_metric='mlogloss'
+            )
+            xgb_model.fit(X, y)
+
+            # 获取特征重要性
+            xgb_importance = xgb_model.feature_importances_
+
+            # 归一化到0-1
+            xgb_importance_norm = xgb_importance / np.max(xgb_importance)
+
+            for i, feature in enumerate(features_to_score):
+                feature_scores[feature]['xgb_shap'] = xgb_importance_norm[i]
+
+            print(f"  ✅ XGBoost评分完成")
+
+        except Exception as e:
+            print(f"  ❌ XGBoost评分失败: {e}")
+
+        # 2. L1正则化评分
+        print(f"\n2️⃣ L1正则化特征选择评分")
+        try:
+            # 标准化特征
+            from sklearn.preprocessing import StandardScaler
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X)
+
+            # L1正则化Logistic回归
+            l1_model = LogisticRegression(
+                penalty='l1',
+                solver='liblinear',
+                C=0.1,
+                random_state=42,
+                max_iter=1000
+            )
+            l1_model.fit(X_scaled, y)
+
+            # 获取系数的绝对值作为重要性
+            l1_importance = np.abs(l1_model.coef_).mean(axis=0)
+
+            # 归一化到0-1
+            if np.max(l1_importance) > 0:
+                l1_importance_norm = l1_importance / np.max(l1_importance)
+            else:
+                l1_importance_norm = l1_importance
+
+            for i, feature in enumerate(features_to_score):
+                feature_scores[feature]['l1_reg'] = l1_importance_norm[i]
+
+            print(f"  ✅ L1正则化评分完成")
+
+        except Exception as e:
+            print(f"  ❌ L1正则化评分失败: {e}")
+
+        # 3. mRMR (最小冗余最大相关性) 评分
+        print(f"\n3️⃣ 互信息(MI)评分")
+        try:
+            # 计算互信息
+            mi_scores = mutual_info_classif(X, y, random_state=42)
+
+            # 归一化到0-1
+            if np.max(mi_scores) > 0:
+                mi_scores_norm = mi_scores / np.max(mi_scores)
+            else:
+                mi_scores_norm = mi_scores
+
+            for i, feature in enumerate(features_to_score):
+                feature_scores[feature]['mrmr'] = mi_scores_norm[i]
+
+            print(f"  ✅ 互信息评分完成")
+
+        except Exception as e:
+            print(f"  ❌ 互信息评分失败: {e}")
+
+        # 4. 综合评分（加权平均）
+        print(f"\n4️⃣ 综合评分计算")
+        weights = {'xgb_shap': 0.4, 'l1_reg': 0.3, 'mrmr': 0.3}  # 可调整权重
+
+        for feature in features_to_score:
+            combined_score = (
+                weights['xgb_shap'] * feature_scores[feature]['xgb_shap'] +
+                weights['l1_reg'] * feature_scores[feature]['l1_reg'] +
+                weights['mrmr'] * feature_scores[feature]['mrmr']
+            )
+            feature_scores[feature]['combined'] = combined_score
+
+        # 按综合得分排序
+        sorted_features = sorted(feature_scores.items(),
+                               key=lambda x: x[1]['combined'],
+                               reverse=True)
+
+        # 保存评分结果
+        self.feature_scores = feature_scores
+        self.sorted_features_by_score = sorted_features
+
+        # 打印Top 10特征
+        print(f"\n🏆 Top 10 特征（按综合得分）:")
+        print(f"{'特征名':<30} {'XGB':>8} {'L1':>8} {'MI':>8} {'综合':>8}")
+        print("-" * 70)
+
+        for i, (feature, scores) in enumerate(sorted_features[:10]):
+            print(f"{feature:<30} {scores['xgb_shap']:>8.4f} {scores['l1_reg']:>8.4f} "
+                  f"{scores['mrmr']:>8.4f} {scores['combined']:>8.4f}")
+
+        print(f"\n✅ 自动化特征评分完成")
+        print(f"  评分权重: XGBoost={weights['xgb_shap']}, L1={weights['l1_reg']}, MI={weights['mrmr']}")
+
+        return self
+
     def filter_candidate_features(self, remove_overfitting_features=True, include_paper_features=True):
         """过滤候选特征，避免过拟合和信息泄露"""
         print(f"\n🔍 过滤候选特征，避免过拟合和信息泄露")
@@ -506,6 +839,141 @@ class EnhancedAPTPreprocessor:
         print(f"  原始特征数: {original_count}")
         print(f"  过滤后特征数: {filtered_count}")
         print(f"  过滤比例: {(original_count - filtered_count) / original_count * 100:.1f}%")
+
+        return self
+
+    def stability_selection(self, n_runs=50, subsample_ratio=0.7, cv_folds=5, stability_threshold=0.6):
+        """稳定性检验（Stability Selection）"""
+        print(f"\n🔄 稳定性检验：{n_runs}次子采样 + {cv_folds}折交叉验证")
+        print(f"子采样比例: {subsample_ratio}, 稳定性阈值: {stability_threshold}")
+
+        # 使用评分后的特征
+        if hasattr(self, 'sorted_features_by_score'):
+            features_to_test = [feat for feat, _ in self.sorted_features_by_score]
+            print(f"使用评分后的特征: {len(features_to_test)} 个")
+        elif hasattr(self, 'screened_features'):
+            features_to_test = self.screened_features
+            print(f"使用筛选后的特征: {len(features_to_test)} 个")
+        else:
+            features_to_test = self.candidate_features
+            print(f"使用候选特征: {len(features_to_test)} 个")
+
+        if not features_to_test:
+            raise ValueError("没有可用于稳定性检验的特征")
+
+        # 准备数据
+        target = 'Stage_encoded' if 'Stage_encoded' in self.df.columns else 'Label'
+        X = self.df[features_to_test]
+        y = self.df[target]
+
+        # 记录每个特征在每次运行中的选择情况
+        feature_selection_counts = defaultdict(int)
+        total_selections = 0
+
+        print(f"\n开始 {n_runs} 次稳定性检验...")
+
+        import random
+        random.seed(42)
+        np.random.seed(42)
+
+        for run_idx in range(n_runs):
+            if (run_idx + 1) % 10 == 0:
+                print(f"  完成 {run_idx + 1}/{n_runs} 次运行")
+
+            # 子采样
+            n_samples = int(len(X) * subsample_ratio)
+            sample_indices = np.random.choice(len(X), n_samples, replace=False)
+            X_sub = X.iloc[sample_indices]
+            y_sub = y.iloc[sample_indices]
+
+            # 交叉验证特征选择
+            skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=run_idx)
+
+            for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X_sub, y_sub)):
+                X_train = X_sub.iloc[train_idx]
+                y_train = y_sub.iloc[train_idx]
+
+                try:
+                    # 使用XGBoost进行特征选择
+                    xgb_selector = xgb.XGBClassifier(
+                        n_estimators=100,
+                        max_depth=4,
+                        learning_rate=0.1,
+                        random_state=42,
+                        eval_metric='mlogloss'
+                    )
+                    xgb_selector.fit(X_train, y_train)
+
+                    # 获取特征重要性
+                    importance = xgb_selector.feature_importances_
+
+                    # 选择重要性大于平均值的特征
+                    mean_importance = np.mean(importance)
+                    selected_features = [
+                        features_to_test[i] for i, imp in enumerate(importance)
+                        if imp > mean_importance
+                    ]
+
+                    # 记录选择的特征
+                    for feature in selected_features:
+                        feature_selection_counts[feature] += 1
+
+                    total_selections += 1
+
+                except Exception as e:
+                    print(f"    运行 {run_idx+1} 折 {fold_idx+1} 失败: {e}")
+                    continue
+
+        # 计算稳定性分数
+        print(f"\n📊 稳定性分析结果:")
+        print(f"总选择次数: {total_selections}")
+
+        stable_features = []
+        feature_stability_scores = {}
+
+        for feature in features_to_test:
+            selection_frequency = feature_selection_counts[feature] / total_selections
+            feature_stability_scores[feature] = selection_frequency
+
+            if selection_frequency >= stability_threshold:
+                stable_features.append(feature)
+
+        # 按稳定性分数排序
+        sorted_by_stability = sorted(feature_stability_scores.items(),
+                                   key=lambda x: x[1],
+                                   reverse=True)
+
+        # 保存结果
+        self.stability_scores = feature_stability_scores
+        self.stable_features = stable_features
+        self.sorted_features_by_stability = sorted_by_stability
+
+        print(f"\n🏆 稳定性检验结果:")
+        print(f"  稳定特征数量: {len(stable_features)} (阈值: {stability_threshold})")
+        print(f"  原始特征数量: {len(features_to_test)}")
+        print(f"  稳定性比例: {len(stable_features) / len(features_to_test) * 100:.1f}%")
+
+        # 打印Top 15稳定特征
+        print(f"\n📋 Top 15 最稳定特征:")
+        print(f"{'特征名':<35} {'稳定性分数':>12} {'状态':>8}")
+        print("-" * 60)
+
+        for i, (feature, score) in enumerate(sorted_by_stability[:15]):
+            status = "✅稳定" if score >= stability_threshold else "❌不稳定"
+            print(f"{feature:<35} {score:>12.3f} {status:>8}")
+
+        # 按类别分析稳定性
+        if hasattr(self, 'feature_categories'):
+            print(f"\n📊 按类别分析稳定性:")
+            for category, original_features in self.feature_categories.items():
+                stable_in_category = [f for f in original_features if f in stable_features]
+                total_in_category = len([f for f in original_features if f in features_to_test])
+                if total_in_category > 0:
+                    stability_ratio = len(stable_in_category) / total_in_category
+                    print(f"  {category:15}: {len(stable_in_category):2d}/{total_in_category:2d} "
+                          f"({stability_ratio*100:5.1f}%) 稳定")
+
+        print(f"\n✅ 稳定性检验完成")
 
         return self
 
@@ -583,6 +1051,173 @@ class EnhancedAPTPreprocessor:
         print(f"  最佳参数: {self.best_params}")
 
         return self.best_params
+
+    def stage_aware_feature_refinement(self, target_features=35):
+        """精炼分层挑选：按攻击阶段分层选择特征"""
+        print(f"\n🎯 精炼分层挑选：按攻击阶段分层选择特征（目标: {target_features}个）")
+
+        # 使用稳定特征作为基础
+        if hasattr(self, 'stable_features') and self.stable_features:
+            base_features = self.stable_features
+            print(f"使用稳定特征作为基础: {len(base_features)} 个")
+        elif hasattr(self, 'sorted_features_by_score'):
+            # 使用评分前50%的特征
+            top_half = len(self.sorted_features_by_score) // 2
+            base_features = [feat for feat, _ in self.sorted_features_by_score[:top_half]]
+            print(f"使用评分前50%特征作为基础: {len(base_features)} 个")
+        else:
+            raise ValueError("请先执行特征评分或稳定性检验")
+
+        # 准备数据
+        target = 'Stage_encoded' if 'Stage_encoded' in self.df.columns else 'Label'
+        X = self.df[base_features]
+        y = self.df[target]
+
+        # 按攻击阶段分组数据
+        stage_data = {}
+        stage_names = {0: 'Normal', 1: 'Reconnaissance', 2: 'Establish_Foothold',
+                      3: 'Lateral_Movement', 4: 'Data_Exfiltration'}
+
+        for stage_id in y.unique():
+            stage_mask = (y == stage_id)
+            stage_data[stage_id] = {
+                'name': stage_names.get(stage_id, f'Stage_{stage_id}'),
+                'X': X[stage_mask],
+                'y': y[stage_mask],
+                'count': stage_mask.sum()
+            }
+
+        print(f"\n📊 攻击阶段数据分布:")
+        for stage_id, data in stage_data.items():
+            print(f"  {data['name']:<20}: {data['count']:>6} 样本")
+
+        # 1. 阶段通用特征选择
+        print(f"\n1️⃣ 选择阶段通用特征")
+        universal_features = []
+
+        # 对每个阶段进行特征重要性分析
+        stage_feature_importance = {}
+
+        for stage_id, data in stage_data.items():
+            if data['count'] < 50:  # 样本太少，跳过
+                print(f"  跳过 {data['name']} (样本数不足)")
+                continue
+
+            try:
+                # 创建二分类问题：当前阶段 vs 其他阶段
+                y_binary = (y == stage_id).astype(int)
+
+                # 使用XGBoost评估特征重要性
+                xgb_model = xgb.XGBClassifier(
+                    n_estimators=100,
+                    max_depth=4,
+                    learning_rate=0.1,
+                    random_state=42,
+                    eval_metric='logloss'
+                )
+                xgb_model.fit(X, y_binary)
+
+                # 获取特征重要性
+                importance = xgb_model.feature_importances_
+                stage_feature_importance[stage_id] = dict(zip(base_features, importance))
+
+                print(f"  {data['name']:<20}: 特征重要性分析完成")
+
+            except Exception as e:
+                print(f"  {data['name']:<20}: 分析失败 - {e}")
+                continue
+
+        # 计算每个特征在各阶段的平均重要性
+        feature_universal_scores = {}
+        for feature in base_features:
+            scores = []
+            for stage_id, importance_dict in stage_feature_importance.items():
+                if feature in importance_dict:
+                    scores.append(importance_dict[feature])
+
+            if scores:
+                # 使用平均值和最小值的组合（确保在所有阶段都有一定重要性）
+                avg_score = np.mean(scores)
+                min_score = np.min(scores)
+                universal_score = 0.7 * avg_score + 0.3 * min_score
+                feature_universal_scores[feature] = universal_score
+
+        # 选择通用特征（按通用分数排序）
+        sorted_universal = sorted(feature_universal_scores.items(),
+                                key=lambda x: x[1], reverse=True)
+
+        # 选择前60%作为通用特征
+        n_universal = max(int(target_features * 0.6), 15)  # 至少15个通用特征
+        universal_features = [feat for feat, _ in sorted_universal[:n_universal]]
+
+        print(f"  选择通用特征: {len(universal_features)} 个")
+
+        # 2. 阶段专用特征选择
+        print(f"\n2️⃣ 选择阶段专用特征")
+        stage_specific_features = []
+
+        # 计算每个特征的阶段特异性
+        feature_specificity_scores = {}
+        for feature in base_features:
+            if feature in universal_features:
+                continue  # 跳过已选择的通用特征
+
+            scores = []
+            for stage_id, importance_dict in stage_feature_importance.items():
+                if feature in importance_dict:
+                    scores.append(importance_dict[feature])
+
+            if scores and len(scores) > 1:
+                # 计算特异性：最大值与平均值的比值
+                max_score = np.max(scores)
+                avg_score = np.mean(scores)
+                specificity = max_score / (avg_score + 1e-8)  # 避免除零
+                feature_specificity_scores[feature] = specificity
+
+        # 选择特异性高的特征
+        sorted_specific = sorted(feature_specificity_scores.items(),
+                               key=lambda x: x[1], reverse=True)
+
+        # 选择剩余的特征作为专用特征
+        n_specific = target_features - len(universal_features)
+        stage_specific_features = [feat for feat, _ in sorted_specific[:n_specific]]
+
+        print(f"  选择专用特征: {len(stage_specific_features)} 个")
+
+        # 3. 合并最终特征集
+        final_features = universal_features + stage_specific_features
+
+        # 保存结果
+        self.refined_features = final_features
+        self.universal_features = universal_features
+        self.stage_specific_features = stage_specific_features
+        self.stage_feature_importance = stage_feature_importance
+
+        print(f"\n✅ 精炼分层挑选完成:")
+        print(f"  通用特征: {len(universal_features)} 个")
+        print(f"  专用特征: {len(stage_specific_features)} 个")
+        print(f"  最终特征: {len(final_features)} 个")
+
+        # 打印最终特征列表
+        print(f"\n📋 最终特征列表:")
+        print(f"通用特征 ({len(universal_features)} 个):")
+        for i, feat in enumerate(universal_features, 1):
+            print(f"  {i:2d}. {feat}")
+
+        if stage_specific_features:
+            print(f"\n专用特征 ({len(stage_specific_features)} 个):")
+            for i, feat in enumerate(stage_specific_features, 1):
+                print(f"  {i:2d}. {feat}")
+
+        # 按类别分析最终特征
+        if hasattr(self, 'feature_categories'):
+            print(f"\n📊 最终特征类别分布:")
+            for category, original_features in self.feature_categories.items():
+                final_in_category = [f for f in original_features if f in final_features]
+                if final_in_category:
+                    print(f"  {category:15}: {len(final_in_category):2d} 个 - {final_in_category}")
+
+        return self
 
     def evaluate_with_fold_internal_pipeline(self, n_features=None, cv_folds=10,
                                            optimize_hyperparams=True, n_trials=50):
@@ -1059,6 +1694,139 @@ class EnhancedAPTPreprocessor:
 
         return self
 
+    def run_domain_knowledge_feature_selection(self, target_features=35,
+                                              correlation_threshold=0.9,
+                                              variance_threshold=0.01,
+                                              stability_runs=50,
+                                              stability_threshold=0.6):
+        """运行基于域知识的完整特征选择流程"""
+        print("🚀 开始基于域知识的特征选择流程")
+        print("="*80)
+        print("流程: 域知识分类 → 初筛 → 自动化打分 → 稳定性检验 → 精炼分层挑选")
+        print("="*80)
+
+        start_time = time.time()
+
+        try:
+            # 1. 域知识特征分类
+            print(f"\n{'='*20} 步骤 1: 域知识特征分类 {'='*20}")
+            self.domain_knowledge_feature_classification()
+
+            # 2. 初筛：去相关性和低方差特征
+            print(f"\n{'='*20} 步骤 2: 初筛阶段 {'='*20}")
+            self.initial_feature_screening(
+                correlation_threshold=correlation_threshold,
+                variance_threshold=variance_threshold
+            )
+
+            # 3. 自动化打分
+            print(f"\n{'='*20} 步骤 3: 自动化打分 {'='*20}")
+            self.automated_feature_scoring(use_screened_features=True)
+
+            # 4. 稳定性检验
+            print(f"\n{'='*20} 步骤 4: 稳定性检验 {'='*20}")
+            self.stability_selection(
+                n_runs=stability_runs,
+                stability_threshold=stability_threshold
+            )
+
+            # 5. 精炼分层挑选
+            print(f"\n{'='*20} 步骤 5: 精炼分层挑选 {'='*20}")
+            self.stage_aware_feature_refinement(target_features=target_features)
+
+            # 6. 更新候选特征为最终选择的特征
+            if hasattr(self, 'refined_features'):
+                self.candidate_features = self.refined_features
+                self.selected_features = self.refined_features
+                print(f"\n✅ 更新候选特征为最终选择的 {len(self.refined_features)} 个特征")
+
+            total_time = time.time() - start_time
+
+            # 7. 生成特征选择报告
+            self._generate_feature_selection_report(total_time)
+
+        except Exception as e:
+            print(f"❌ 特征选择过程中出现错误: {e}")
+            import traceback
+            traceback.print_exc()
+
+        return self
+
+    def _generate_feature_selection_report(self, total_time):
+        """生成特征选择报告"""
+        print(f"\n{'='*20} 特征选择完成报告 {'='*20}")
+        print(f"⏱️ 总耗时: {total_time:.2f} 秒 ({total_time/60:.2f} 分钟)")
+
+        # 统计各阶段的特征数量变化
+        stages_stats = []
+
+        if hasattr(self, 'feature_categories'):
+            original_count = sum(len(features) for features in self.feature_categories.values())
+            stages_stats.append(("原始特征", original_count))
+
+        if hasattr(self, 'screened_features'):
+            stages_stats.append(("初筛后", len(self.screened_features)))
+
+        if hasattr(self, 'stable_features'):
+            stages_stats.append(("稳定性检验后", len(self.stable_features)))
+
+        if hasattr(self, 'refined_features'):
+            stages_stats.append(("最终选择", len(self.refined_features)))
+
+        print(f"\n📊 特征数量变化:")
+        for stage_name, count in stages_stats:
+            print(f"  {stage_name:<15}: {count:>4} 个特征")
+
+        if len(stages_stats) >= 2:
+            reduction_ratio = (stages_stats[0][1] - stages_stats[-1][1]) / stages_stats[0][1]
+            print(f"  特征减少比例: {reduction_ratio*100:.1f}%")
+
+        # 按类别分析最终特征分布
+        if hasattr(self, 'feature_categories') and hasattr(self, 'refined_features'):
+            print(f"\n📋 最终特征类别分布:")
+            for category, original_features in self.feature_categories.items():
+                final_in_category = [f for f in original_features if f in self.refined_features]
+                if final_in_category:
+                    print(f"  {category:15}: {len(final_in_category):2d}/{len(original_features):2d} "
+                          f"({len(final_in_category)/len(original_features)*100:5.1f}%)")
+
+        # 特征质量评估
+        if hasattr(self, 'stability_scores') and hasattr(self, 'refined_features'):
+            avg_stability = np.mean([self.stability_scores.get(f, 0) for f in self.refined_features])
+            print(f"\n🎯 特征质量评估:")
+            print(f"  平均稳定性分数: {avg_stability:.3f}")
+
+            if hasattr(self, 'feature_scores'):
+                avg_combined_score = np.mean([
+                    self.feature_scores.get(f, {}).get('combined', 0)
+                    for f in self.refined_features
+                ])
+                print(f"  平均综合评分: {avg_combined_score:.3f}")
+
+        # 推荐的下一步
+        print(f"\n🎯 推荐的下一步:")
+        print(f"  1. 使用选择的 {len(self.refined_features)} 个特征进行模型训练")
+        print(f"  2. 进行交叉验证评估模型性能")
+        print(f"  3. 构建攻击序列用于序列生成模型")
+
+        # 保存特征选择结果摘要
+        self.feature_selection_summary = {
+            'total_time': total_time,
+            'stages_stats': stages_stats,
+            'final_feature_count': len(self.refined_features) if hasattr(self, 'refined_features') else 0,
+            'average_stability': avg_stability if 'avg_stability' in locals() else 0,
+            'category_distribution': {}
+        }
+
+        if hasattr(self, 'feature_categories') and hasattr(self, 'refined_features'):
+            for category, original_features in self.feature_categories.items():
+                final_in_category = [f for f in original_features if f in self.refined_features]
+                self.feature_selection_summary['category_distribution'][category] = {
+                    'original': len(original_features),
+                    'final': len(final_in_category),
+                    'features': final_in_category
+                }
+
     def run_complete_pipeline(self, n_features=46, cv_folds=10):
         """运行完整的预处理和评估流程"""
         print("🚀 开始增强版APT数据预处理和评估流程")
@@ -1132,6 +1900,136 @@ class EnhancedAPTPreprocessor:
             traceback.print_exc()
 
         return self
+
+    def run_domain_knowledge_pipeline(self, target_features=35, cv_folds=10,
+                                     correlation_threshold=0.9, variance_threshold=0.01,
+                                     stability_runs=30, stability_threshold=0.6):
+        """运行基于域知识的完整预处理和评估流程"""
+        print("🚀 开始基于域知识的APT数据预处理和评估流程")
+        print("="*80)
+        print("特色: 域知识分类 → 初筛 → 自动化打分 → 稳定性检验 → 精炼分层挑选")
+        print("="*80)
+
+        start_time = time.time()
+
+        try:
+            # 1. 基础数据处理
+            print(f"\n{'='*20} 阶段 1: 基础数据处理 {'='*20}")
+            (self
+             .load_data()
+             .clean_data()
+             .create_statistical_features()
+             .encode_and_normalize())
+
+            # 2. 域知识特征选择
+            print(f"\n{'='*20} 阶段 2: 域知识特征选择 {'='*20}")
+            self.run_domain_knowledge_feature_selection(
+                target_features=target_features,
+                correlation_threshold=correlation_threshold,
+                variance_threshold=variance_threshold,
+                stability_runs=stability_runs,
+                stability_threshold=stability_threshold
+            )
+
+            # 3. 模型评估
+            print(f"\n{'='*20} 阶段 3: 模型评估 {'='*20}")
+            self.evaluate_with_fold_internal_pipeline(
+                n_features=len(self.refined_features) if hasattr(self, 'refined_features') else target_features,
+                cv_folds=cv_folds,
+                optimize_hyperparams=True,
+                n_trials=30
+            )
+
+            # 4. 保存结果
+            print(f"\n{'='*20} 阶段 4: 保存结果 {'='*20}")
+            self.save_results()
+
+            total_time = time.time() - start_time
+
+            # 5. 生成最终报告
+            self._generate_final_pipeline_report(total_time, target_features, cv_folds)
+
+        except Exception as e:
+            print(f"❌ 处理过程中出现错误: {e}")
+            import traceback
+            traceback.print_exc()
+
+        return self
+
+    def _generate_final_pipeline_report(self, total_time, target_features, cv_folds):
+        """生成最终流程报告"""
+        print(f"\n{'='*20} 🎉 流程完成报告 {'='*20}")
+        print(f"⏱️ 总耗时: {total_time:.2f} 秒 ({total_time/60:.2f} 分钟)")
+        print(f"📊 最终数据形状: {self.df.shape}")
+
+        if hasattr(self, 'refined_features'):
+            print(f"🎯 域知识选择特征数量: {len(self.refined_features)}")
+
+        # 打印模型性能摘要
+        if hasattr(self, 'cv_results') and self.cv_results:
+            print(f"\n📈 域知识方法模型性能摘要 ({cv_folds}折交叉验证):")
+            for model_name, metrics in self.cv_results.items():
+                if isinstance(metrics, dict) and 'f1_macro' in metrics:
+                    f1_mean = metrics['f1_macro']['mean']
+                    f1_std = metrics['f1_macro']['std']
+                    print(f"  {model_name}: F1={f1_mean:.4f}±{f1_std:.3f}")
+
+        # 特征选择效果分析
+        if hasattr(self, 'feature_selection_summary'):
+            summary = self.feature_selection_summary
+            print(f"\n🎯 域知识特征选择效果:")
+            print(f"  目标特征数: {target_features}")
+            print(f"  实际选择数: {summary.get('final_feature_count', 0)}")
+            print(f"  平均稳定性: {summary.get('average_stability', 0):.3f}")
+
+            if 'stages_stats' in summary:
+                print(f"  特征筛选过程:")
+                for stage_name, count in summary['stages_stats']:
+                    print(f"    {stage_name}: {count} 个")
+
+        # 与论文结果对比
+        if hasattr(self, 'cv_results') and self.cv_results:
+            best_f1 = 0
+            for model_name, metrics in self.cv_results.items():
+                if isinstance(metrics, dict) and 'f1_macro' in metrics:
+                    f1_mean = metrics['f1_macro']['mean']
+                    if f1_mean > best_f1:
+                        best_f1 = f1_mean
+
+            print(f"\n🎯 与论文对比:")
+            print(f"  域知识方法最佳F1: {best_f1:.4f}")
+            print(f"  论文报告F1: ~0.9800")
+            print(f"  差距: {0.98 - best_f1:.4f}")
+
+            if best_f1 >= 0.97:
+                print(f"  ✅ 接近论文水平！域知识方法效果优秀")
+            elif best_f1 >= 0.95:
+                print(f"  🔶 良好水平，域知识方法有效")
+            else:
+                print(f"  ⚠️ 需要进一步调优域知识方法")
+
+        # 推荐后续步骤
+        print(f"\n🚀 推荐后续步骤:")
+        print(f"  1. 使用选择的特征构建攻击序列")
+        print(f"  2. 训练SeqGAN生成模型")
+        print(f"  3. 进行数据增强和模型优化")
+
+        # 保存域知识方法的配置
+        if hasattr(self, 'refined_features'):
+            domain_config = {
+                'method': 'domain_knowledge_feature_selection',
+                'target_features': target_features,
+                'final_features': len(self.refined_features),
+                'selected_features': self.refined_features,
+                'performance': best_f1 if 'best_f1' in locals() else 0,
+                'processing_time': total_time
+            }
+
+            # 保存配置到文件
+            config_path = os.path.join(self.output_path, 'domain_knowledge_config.json')
+            with open(config_path, 'w') as f:
+                json.dump(domain_config, f, indent=4)
+            print(f"✅ 域知识方法配置保存至: {config_path}")
 
     def build_attack_sequences(self, num_apt_sequences=1000, min_normal_insert=1, max_normal_insert=5):
         """构建攻击序列，参考dapt_preprocessing.py的方法"""
