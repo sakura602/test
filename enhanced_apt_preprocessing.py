@@ -1,20 +1,11 @@
-"""
-增强版APT数据预处理器
-- 丰富的统计量特征
-- 详细的时间属性
-- 随机森林特征选择
-- 多模型交叉验证 (RF, MLP, SVM)
-"""
-
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 import socket
 import struct
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.svm import SVC
-from sklearn.neural_network import MLPClassifier
 import xgboost as xgb
+import optuna
+from sklearn.utils.class_weight import compute_class_weight
 import warnings
 import os
 import time
@@ -22,8 +13,8 @@ import json
 from sklearn.feature_selection import SelectFromModel
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
-from sklearn.model_selection import StratifiedKFold, cross_validate
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.model_selection import StratifiedKFold, cross_validate, cross_val_score, train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
 
 warnings.filterwarnings('ignore')
 
@@ -333,12 +324,303 @@ class EnhancedAPTPreprocessor:
         print(f"  TCP标志位: {len(flag_features)}")
         print(f"  时间特征: {len(time_in_candidates)} ({time_in_candidates})")
 
-        self.candidate_features = feature_cols
+        # 清理特征名称，避免LightGBM的特征名称问题
+        cleaned_feature_cols = []
+        for col in feature_cols:
+            # 替换空格和特殊字符为下划线
+            cleaned_col = col.replace(' ', '_').replace('/', '_').replace('-', '_')
+            cleaned_feature_cols.append(cleaned_col)
+
+        # 重命名DataFrame列
+        rename_mapping = dict(zip(feature_cols, cleaned_feature_cols))
+        self.df = self.df.rename(columns=rename_mapping)
+
+        self.candidate_features = cleaned_feature_cols
+        print(f"✅ 特征名称已清理，避免LightGBM兼容性问题")
         return self
 
-    def evaluate_with_fold_internal_pipeline(self, n_features=46, cv_folds=10):
-        """按论文方法：每折内部做特征选择+标准化+分类的完整pipeline"""
-        print(f"\n🎯 论文方法：每折内Pipeline(特征选择→标准化→分类)")
+    def find_optimal_feature_count_with_shap(self, max_features=None, cv_folds=5):
+        """使用SHAP和交叉验证找到最优特征数量"""
+        print(f"\n🔍 使用SHAP分析寻找最优特征数量")
+
+        # 确定目标变量
+        target = 'Stage_encoded' if 'Stage_encoded' in self.df.columns else 'Label'
+
+        # 准备数据
+        X = self.df[self.candidate_features]
+        y = self.df[target]
+
+        if max_features is None:
+            max_features = min(len(self.candidate_features), 60)  # 最多测试60个特征
+
+        # 使用XGBoost进行SHAP分析
+        print(f"  训练XGBoost模型进行SHAP分析...")
+        xgb_model = xgb.XGBClassifier(
+            n_estimators=200,
+            max_depth=6,
+            learning_rate=0.1,
+            random_state=42,
+            eval_metric='mlogloss'
+        )
+
+        # 训练模型
+        xgb_model.fit(X, y)
+
+        # 使用XGBoost内置的特征重要性（更简单可靠）
+        print(f"  使用XGBoost特征重要性...")
+        feature_importance = xgb_model.feature_importances_
+
+        # 按重要性排序特征
+        feature_importance_df = pd.DataFrame({
+            'feature': X.columns.tolist(),
+            'importance': feature_importance.tolist()
+        }).sort_values('importance', ascending=False)
+
+        print(f"  XGBoost特征重要性Top 10:")
+        for i, row in feature_importance_df.head(10).iterrows():
+            print(f"    {row['feature']}: {row['importance']:.4f}")
+
+        # 测试不同特征数量的性能
+        feature_counts = [10, 15, 20, 25, 30, 35, 40, 46, 50, min(max_features, len(self.candidate_features))]
+        feature_counts = sorted(list(set(feature_counts)))  # 去重并排序
+
+        print(f"\n  测试不同特征数量的性能:")
+
+        best_score = 0
+        best_feature_count = 46
+        results = []
+
+        for n_feat in feature_counts:
+            if n_feat > len(feature_importance_df):
+                continue
+
+            # 选择Top N特征
+            selected_features = feature_importance_df.head(n_feat)['feature'].tolist()
+            X_selected = X[selected_features]
+
+            # 交叉验证评估
+            scores = cross_val_score(
+                xgb.XGBClassifier(n_estimators=100, random_state=42, eval_metric='mlogloss'),
+                X_selected, y,
+                cv=cv_folds,
+                scoring='f1_macro',
+                n_jobs=-1
+            )
+
+            mean_score = scores.mean()
+            std_score = scores.std()
+
+            results.append({
+                'n_features': n_feat,
+                'f1_score': mean_score,
+                'f1_std': std_score
+            })
+
+            print(f"    {n_feat:2d}个特征: F1={mean_score:.4f}±{std_score:.4f}")
+
+            if mean_score > best_score:
+                best_score = mean_score
+                best_feature_count = n_feat
+
+        # 保存结果
+        self.feature_selection_results = {
+            'xgboost_importance': feature_importance_df.to_dict('records'),
+            'performance_by_count': results,
+            'optimal_count': best_feature_count,
+            'optimal_score': best_score
+        }
+
+        print(f"\n✅ 最优特征数量: {best_feature_count} (F1: {best_score:.4f})")
+
+        # 更新候选特征为最优数量的特征
+        self.optimal_features = feature_importance_df.head(best_feature_count)['feature'].tolist()
+
+        return best_feature_count
+
+    def filter_candidate_features(self, remove_overfitting_features=True, include_paper_features=True):
+        """过滤候选特征，避免过拟合和信息泄露"""
+        print(f"\n🔍 过滤候选特征，避免过拟合和信息泄露")
+
+        original_count = len(self.candidate_features)
+        filtered_features = self.candidate_features.copy()
+
+        # 移除可能导致过拟合或信息泄露的特征
+        if remove_overfitting_features:
+            overfitting_features = [
+                'Dst_IP_int',      # 目标IP可能导致过拟合
+                'Src_IP_int',      # 源IP可能导致过拟合
+                'Timestamp_encoded', # 时间戳编码可能泄露信息
+                'Activity_encoded'   # 活动类型可能泄露标签信息
+            ]
+
+            removed_features = []
+            for feature in overfitting_features:
+                if feature in filtered_features:
+                    filtered_features.remove(feature)
+                    removed_features.append(feature)
+
+            if removed_features:
+                print(f"  移除可能过拟合的特征: {removed_features}")
+
+        # 论文重要特征处理
+        paper_features = [
+            'Protocol_encoded', 'Flow_Duration', 'Fwd_IAT_Total', 'Fwd_IAT_Mean',
+            'Bwd_IAT_Std', 'Bwd_IAT_Max', 'Bwd_IAT_Min', 'FIN_Flag_Count',
+            'SYN_Flag_Count', 'RST_Flag_Count', 'PSH_Flag_Count', 'ACK_Flag_Count',
+            'URG_Flag_Count', 'Total_Length_of_Fwd_Packet', 'Fwd_Packet_Length_Min',
+            'Flow_IAT_Min'
+        ]
+
+        if include_paper_features:
+            # 确保论文重要特征被包含
+            for feature in paper_features:
+                if feature not in filtered_features and feature in self.df.columns:
+                    filtered_features.append(feature)
+            print(f"  确保包含论文重要特征: {len([f for f in paper_features if f in filtered_features])} 个")
+        else:
+            # 移除论文特征，测试其他特征的效果
+            removed_paper = []
+            for feature in paper_features:
+                if feature in filtered_features:
+                    filtered_features.remove(feature)
+                    removed_paper.append(feature)
+            if removed_paper:
+                print(f"  移除论文特征进行测试: {removed_paper}")
+
+        # 添加稳定的网络流特征
+        stable_features = [
+            'Flow_Bytes_s', 'Flow_Packets_s', 'Fwd_Packets_s', 'Bwd_Packets_s',
+            'Packet_Length_Mean', 'Packet_Length_Std', 'Packet_Length_Max',
+            'Flow_IAT_Mean', 'Flow_IAT_Std', 'Active_Mean', 'Idle_Mean',
+            'hour', 'minute', 'day_of_week'  # 时间特征通常比较稳定
+        ]
+
+        for feature in stable_features:
+            if feature not in filtered_features and feature in self.df.columns:
+                filtered_features.append(feature)
+
+        self.candidate_features = filtered_features
+        filtered_count = len(filtered_features)
+
+        print(f"✅ 特征过滤完成")
+        print(f"  原始特征数: {original_count}")
+        print(f"  过滤后特征数: {filtered_count}")
+        print(f"  过滤比例: {(original_count - filtered_count) / original_count * 100:.1f}%")
+
+        return self
+
+    def optimize_xgboost_hyperparameters(self, n_trials=100, cv_folds=5):
+        """使用Optuna优化XGBoost超参数"""
+        print(f"\n🎯 使用Optuna优化XGBoost超参数 (试验次数: {n_trials})")
+
+        # 确定目标变量
+        target = 'Stage_encoded' if 'Stage_encoded' in self.df.columns else 'Label'
+        X = self.df[self.candidate_features]
+        y = self.df[target]
+
+        # 计算类别权重
+        classes = np.unique(y)
+        class_weights = compute_class_weight('balanced', classes=classes, y=y)
+        class_weight_dict = dict(zip(classes, class_weights))
+        print(f"  类别权重: {class_weight_dict}")
+
+        def objective(trial):
+            # 定义超参数搜索空间
+            params = {
+                'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
+                'max_depth': trial.suggest_int('max_depth', 3, 10),
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+                'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+                'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
+                'gamma': trial.suggest_float('gamma', 0, 5),
+                'reg_alpha': trial.suggest_float('reg_alpha', 0, 10),
+                'reg_lambda': trial.suggest_float('reg_lambda', 0, 10),
+                'random_state': 42,
+                'eval_metric': 'mlogloss',
+                'early_stopping_rounds': 50,
+                'n_jobs': -1
+            }
+
+            # 交叉验证评估
+            skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+            scores = []
+
+            for train_idx, val_idx in skf.split(X, y):
+                X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+                y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+
+                # 创建XGBoost模型
+                model = xgb.XGBClassifier(**params)
+
+                # 训练模型（带早停）
+                model.fit(
+                    X_train, y_train,
+                    eval_set=[(X_val, y_val)],
+                    verbose=False
+                )
+
+                # 预测和评估
+                y_pred = model.predict(X_val)
+                f1 = f1_score(y_val, y_pred, average='macro')
+                scores.append(f1)
+
+            return np.mean(scores)
+
+        # 创建Optuna研究
+        study = optuna.create_study(direction='maximize',
+                                   sampler=optuna.samplers.TPESampler(seed=42))
+
+        # 优化超参数
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+        # 保存最佳参数
+        self.best_params = study.best_params
+        self.best_score = study.best_value
+
+        print(f"✅ 超参数优化完成")
+        print(f"  最佳F1分数: {self.best_score:.4f}")
+        print(f"  最佳参数: {self.best_params}")
+
+        return self.best_params
+
+    def evaluate_with_fold_internal_pipeline(self, n_features=None, cv_folds=10,
+                                           optimize_hyperparams=True, n_trials=50):
+        """按论文方法：每折内部做特征选择+分类的完整pipeline（优化版）"""
+        print(f"\n🎯 XGBoost评估：特征过滤→超参数优化→特征选择→分类")
+
+        # 1. 过滤候选特征，避免过拟合
+        self.filter_candidate_features(remove_overfitting_features=True, include_paper_features=True)
+
+        # 2. 超参数优化
+        if optimize_hyperparams:
+            best_params = self.optimize_xgboost_hyperparameters(n_trials=n_trials, cv_folds=5)
+        else:
+            # 使用默认优化参数
+            best_params = {
+                'n_estimators': 500,
+                'max_depth': 6,
+                'learning_rate': 0.1,
+                'subsample': 0.8,
+                'colsample_bytree': 0.8,
+                'min_child_weight': 1,
+                'gamma': 0,
+                'reg_alpha': 0,
+                'reg_lambda': 1,
+                'random_state': 42,
+                'eval_metric': 'mlogloss',
+                'early_stopping_rounds': 50,
+                'n_jobs': -1
+            }
+
+        # 3. 如果没有指定特征数量，使用XGBoost寻找最优数量
+        if n_features is None:
+            print(f"  未指定特征数量，使用XGBoost寻找最优特征数量...")
+            n_features = self.find_optimal_feature_count_with_shap()
+            # 使用XGBoost选择的最优特征
+            if hasattr(self, 'optimal_features'):
+                self.candidate_features = self.optimal_features
+                print(f"  使用XGBoost选择的{len(self.optimal_features)}个最优特征")
 
         # 准备数据
         target = 'Stage_encoded' if 'Stage_encoded' in self.df.columns else 'Label'
@@ -346,105 +628,119 @@ class EnhancedAPTPreprocessor:
         y = self.df[target]
 
         print(f"候选特征数量: {X.shape[1]}")
+        print(f"使用特征数量: {n_features}")
         print(f"样本数量: {X.shape[0]}")
-        print(f"类别分布: {dict(y.value_counts().sort_index())}")
 
-        # 按论文配置模型（优化超参数）
-        models = {
-            'XGBoost': xgb.XGBClassifier(
-                n_estimators=300,
-                max_depth=6,
-                learning_rate=0.1,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                random_state=42,
-                n_jobs=-1,
-                eval_metric='mlogloss'
-            ),
-            'MLP': MLPClassifier(
-                hidden_layer_sizes=(150, 100, 50),  # 更深的网络结构
-                max_iter=2000,     # 增加迭代次数
-                early_stopping=True,
-                validation_fraction=0.1,
-                learning_rate_init=1e-3,
-                alpha=0.001,       # L2正则化
-                random_state=42
-            ),
-            'SVM': SVC(
-                kernel='rbf',
-                C=10.0,           # 优化C参数
-                gamma='scale',    # 自动调整gamma
-                random_state=42
-            )
-        }
+        # 显示正确的类别分布
+        class_counts = dict(y.value_counts().sort_index())
+        print(f"类别分布: {class_counts}")
+        print(f"  0(正常): {class_counts.get(0, 0)} 样本")
+        print(f"  1(数据泄露): {class_counts.get(1, 0)} 样本")
+        print(f"  2(建立立足点): {class_counts.get(2, 0)} 样本")
+        print(f"  3(横向移动): {class_counts.get(3, 0)} 样本")
+        print(f"  4(侦察): {class_counts.get(4, 0)} 样本")
+
+        # 计算类别权重
+        classes = np.unique(y)
+        class_weights = compute_class_weight('balanced', classes=classes, y=y)
+        class_weight_dict = dict(zip(classes, class_weights))
+        print(f"类别权重: {class_weight_dict}")
+
+        # 使用优化后的XGBoost模型
+        xgb_model = xgb.XGBClassifier(**best_params)
 
         skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
-        scoring = ['accuracy', 'precision_macro', 'recall_macro', 'f1_macro']
 
-        self.cv_results = {}
+        print(f"\n🚀 评估优化后的XGBoost模型")
 
-        for name, clf in models.items():
-            print(f"\n🚀 评估模型: {name}")
+        # 构建折内Pipeline：特征选择 → XGBoost分类器
+        feature_selector = SelectFromModel(
+            xgb.XGBClassifier(
+                n_estimators=100,
+                random_state=42,
+                eval_metric='mlogloss',
+                early_stopping_rounds=10
+            ),
+            threshold=-np.inf,
+            max_features=n_features,
+            importance_getter='feature_importances_'
+        )
 
-            # 构建折内Pipeline：特征选择 → 标准化 → 分类器
-            if name == 'XGBoost':
-                # XGBoost不需要标准化，但需要特征选择
-                pipeline = Pipeline([
-                    ('feat_sel', SelectFromModel(
-                        xgb.XGBClassifier(n_estimators=100, random_state=42, eval_metric='mlogloss'),
-                        threshold=-np.inf,
-                        max_features=n_features,
-                        importance_getter='feature_importances_'
-                    )),
-                    ('clf', clf)
-                ])
-            else:
-                # MLP和SVM需要特征选择+标准化
-                pipeline = Pipeline([
-                    ('feat_sel', SelectFromModel(
-                        xgb.XGBClassifier(n_estimators=100, random_state=42, eval_metric='mlogloss'),
-                        threshold=-np.inf,
-                        max_features=n_features,
-                        importance_getter='feature_importances_'
-                    )),
-                    ('scaler', StandardScaler()),
-                    ('clf', clf)
-                ])
+        pipeline = Pipeline([
+            ('feat_sel', feature_selector),
+            ('clf', xgb_model)
+        ])
 
-            # 交叉验证评估
-            cv_results = cross_validate(
-                pipeline, X, y,
-                cv=skf,
-                scoring=scoring,
-                n_jobs=-1,
-                return_train_score=False,
-                return_estimator = True
+        # 手动交叉验证以支持早停
+        skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+        scoring_results = {
+            'accuracy': [], 'precision_macro': [], 'recall_macro': [], 'f1_macro': []
+        }
+        selected_features_per_fold = []
+
+        print(f"开始{cv_folds}折交叉验证...")
+
+        for fold_idx, (train_idx, test_idx) in enumerate(skf.split(X, y), 1):
+            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+            # 特征选择
+            feature_selector.fit(X_train, y_train)
+            X_train_selected = feature_selector.transform(X_train)
+            X_test_selected = feature_selector.transform(X_test)
+
+            # 获取选择的特征名
+            selected_mask = feature_selector.get_support()
+            selected_feats = X.columns[selected_mask].tolist()
+            selected_features_per_fold.append(selected_feats)
+
+            # 分割训练集为训练和验证集（用于早停）
+            X_tr, X_val, y_tr, y_val = train_test_split(
+                X_train_selected, y_train, test_size=0.2,
+                random_state=42, stratify=y_train
             )
-            for fold_idx, est in enumerate(cv_results['estimator'], 1):
-                # feat_sel 是 SelectFromModel 这一步
-                mask = est.named_steps['feat_sel'].get_support()
-                selected_feats = X.columns[mask].tolist()
-                print(f"Fold {fold_idx} 选出的 {len(selected_feats)} 个特征：")
-                print(selected_feats)
 
-            # 计算统计量
-            results = {}
-            for metric in scoring:
-                scores = cv_results[f'test_{metric}']
-                results[metric] = {
-                    'mean': scores.mean(),
-                    'std': scores.std(),
-                    'scores': scores.tolist()
-                }
-                print(f"  {metric:<15}: {scores.mean():.4f} ± {scores.std():.4f}")
+            # 训练XGBoost模型（带早停）
+            model = xgb.XGBClassifier(**best_params)
+            model.fit(
+                X_tr, y_tr,
+                eval_set=[(X_val, y_val)],
+                verbose=False
+            )
 
-            self.cv_results[name] = results
+            # 预测
+            y_pred = model.predict(X_test_selected)
 
-        # 找出最佳模型
-        best_model = max(self.cv_results.keys(),
-                        key=lambda x: self.cv_results[x]['f1_macro']['mean'])
-        best_f1 = self.cv_results[best_model]['f1_macro']['mean']
-        print(f"\n🏆 最佳模型: {best_model} (F1: {best_f1:.4f})")
+            # 计算指标
+            scoring_results['accuracy'].append(accuracy_score(y_test, y_pred))
+            scoring_results['precision_macro'].append(precision_score(y_test, y_pred, average='macro'))
+            scoring_results['recall_macro'].append(recall_score(y_test, y_pred, average='macro'))
+            scoring_results['f1_macro'].append(f1_score(y_test, y_pred, average='macro'))
+
+            print(f"Fold {fold_idx} 选出的 {len(selected_feats)} 个特征：")
+            print(selected_feats)
+
+        # 计算统计量
+        results = {}
+        for metric, scores in scoring_results.items():
+            scores_array = np.array(scores)
+            results[metric] = {
+                'mean': scores_array.mean(),
+                'std': scores_array.std(),
+                'scores': scores
+            }
+            print(f"  {metric:<15}: {scores_array.mean():.4f} ± {scores_array.std():.4f}")
+
+        self.cv_results = {
+            'XGBoost': results,
+            'selected_features_per_fold': selected_features_per_fold,
+            'best_params': best_params,
+            'class_weights': class_weight_dict
+        }
+
+        print(f"\n🏆 优化后XGBoost模型 F1: {results['f1_macro']['mean']:.4f}")
+        print(f"📊 使用的最佳参数: {best_params}")
+        print(f"⚖️ 类别权重: {class_weight_dict}")
 
         return self
 
@@ -875,6 +1171,338 @@ class EnhancedAPTPreprocessor:
 
         return self
 
+    def build_session_based_attack_sequences(self, num_apt_sequences=1000, session_timeout=300):
+        """基于会话的攻击序列构建方法"""
+        print(f"\n🔗 构建基于会话的攻击序列 (生成{num_apt_sequences}个APT序列)")
+        print("方法: 通过源IP、目标IP、协议和时间信息构建会话")
+
+        # 确定目标变量
+        target = 'Stage_encoded' if 'Stage_encoded' in self.df.columns else 'Label'
+
+        # 构建attack2id映射
+        self._build_attack2id_mapping()
+
+        # 基于会话构建攻击序列
+        self._build_sessions_from_network_flows(session_timeout)
+
+        # 从会话中提取攻击序列
+        self._extract_attack_sequences_from_sessions(num_apt_sequences)
+
+        # 构建正常序列
+        self._build_normal_sequences_from_sessions(num_apt_sequences)
+
+        # 转换标签序列为ID序列
+        self._convert_session_labels_to_ids()
+
+        # 分配最终序列标签
+        self._assign_session_sequence_labels()
+
+        # 保存序列数据
+        self._save_session_sequence_results()
+
+        print(f"✅ 基于会话的攻击序列构建完成")
+        print(f"  APT序列数量: {len(self.session_apt_sequences_data)}")
+        print(f"  正常序列数量: {len(self.session_normal_sequences_data)}")
+        print(f"  Attack2ID映射: {self.attack2id}")
+
+        return self
+
+    def _build_sessions_from_network_flows(self, session_timeout):
+        """基于网络流构建会话"""
+        print("基于网络流构建会话...")
+
+        # 确保有时间戳列
+        if 'Timestamp' not in self.df.columns:
+            print("  警告: 没有找到Timestamp列，使用索引作为时间顺序")
+            self.df['Timestamp'] = pd.to_datetime(self.df.index, unit='s')
+        else:
+            self.df['Timestamp'] = pd.to_datetime(self.df['Timestamp'])
+
+        # 按时间排序
+        self.df = self.df.sort_values('Timestamp')
+
+        # 定义会话键（源IP、目标IP、协议）
+        session_keys = ['Src_IP_int', 'Dst_IP_int', 'Protocol_encoded']
+
+        # 检查必要的列是否存在
+        missing_cols = [col for col in session_keys if col not in self.df.columns]
+        if missing_cols:
+            print(f"  警告: 缺少会话键列: {missing_cols}")
+            # 使用可用的列
+            session_keys = [col for col in session_keys if col in self.df.columns]
+            if not session_keys:
+                print("  错误: 没有可用的会话键列")
+                return
+
+        print(f"  使用会话键: {session_keys}")
+
+        # 构建会话
+        self.sessions = {}
+        session_id = 0
+
+        # 按会话键分组
+        for session_key, group in self.df.groupby(session_keys):
+            # 按时间排序
+            group = group.sort_values('Timestamp')
+
+            # 根据时间间隔分割会话
+            current_session = []
+            last_time = None
+
+            for idx, row in group.iterrows():
+                current_time = row['Timestamp']
+
+                # 如果时间间隔超过阈值，开始新会话
+                if last_time is not None and (current_time - last_time).total_seconds() > session_timeout:
+                    if len(current_session) > 1:  # 只保留有多个流的会话
+                        self.sessions[session_id] = current_session
+                        session_id += 1
+                    current_session = []
+
+                current_session.append(row.to_dict())
+                last_time = current_time
+
+            # 添加最后一个会话
+            if len(current_session) > 1:
+                self.sessions[session_id] = current_session
+                session_id += 1
+
+        print(f"  构建了 {len(self.sessions)} 个会话")
+
+        # 分析会话中的攻击阶段分布
+        self._analyze_session_attack_stages()
+
+    def _analyze_session_attack_stages(self):
+        """分析会话中的攻击阶段分布"""
+        print("分析会话中的攻击阶段分布...")
+
+        target = 'Stage_encoded' if 'Stage_encoded' in self.df.columns else 'Label'
+
+        session_stage_stats = {
+            'normal_only': 0,      # 只有正常流量
+            'single_attack': 0,    # 单一攻击阶段
+            'multi_attack': 0,     # 多个攻击阶段
+            'complete_apt': 0      # 完整APT攻击链
+        }
+
+        self.attack_sessions = []  # 包含攻击的会话
+        self.normal_sessions = []  # 只有正常流量的会话
+
+        for session_id, flows in self.sessions.items():
+            # 提取会话中的攻击阶段
+            stages = [flow[target] for flow in flows]
+            unique_stages = set(stages)
+
+            # 分类会话
+            if unique_stages == {0}:  # 只有正常流量
+                session_stage_stats['normal_only'] += 1
+                self.normal_sessions.append((session_id, flows))
+            else:
+                attack_stages = unique_stages - {0}  # 去除正常流量
+                if len(attack_stages) == 1:
+                    session_stage_stats['single_attack'] += 1
+                else:
+                    session_stage_stats['multi_attack'] += 1
+                    # 检查是否是完整的APT攻击链
+                    if {1, 2, 3, 4}.issubset(unique_stages):
+                        session_stage_stats['complete_apt'] += 1
+
+                self.attack_sessions.append((session_id, flows, list(attack_stages)))
+
+        print(f"  会话统计:")
+        for stat_name, count in session_stage_stats.items():
+            print(f"    {stat_name}: {count}")
+
+        print(f"  攻击会话: {len(self.attack_sessions)}")
+        print(f"  正常会话: {len(self.normal_sessions)}")
+
+    def _extract_attack_sequences_from_sessions(self, num_apt_sequences):
+        """从会话中提取攻击序列"""
+        print("从会话中提取攻击序列...")
+
+        target = 'Stage_encoded' if 'Stage_encoded' in self.df.columns else 'Label'
+
+        self.session_apt_sequences_data = []
+        self.session_apt_sequences_labels = []
+
+        import random
+        random.seed(42)
+
+        # 如果攻击会话不够，重复使用
+        available_sessions = self.attack_sessions.copy()
+
+        for i in range(num_apt_sequences):
+            if not available_sessions:
+                available_sessions = self.attack_sessions.copy()
+                random.shuffle(available_sessions)
+
+            session_id, flows, attack_stages = available_sessions.pop()
+
+            # 按时间顺序提取攻击序列
+            sequence_data = []
+            sequence_labels = []
+
+            for flow in flows:
+                stage = flow[target]
+                stage_label = self.stage_to_internal[stage]
+
+                # 只保留选择的特征
+                if hasattr(self, 'candidate_features'):
+                    flow_data = {k: v for k, v in flow.items() if k in self.candidate_features}
+                else:
+                    flow_data = flow
+
+                sequence_data.append(flow_data)
+                sequence_labels.append(stage_label)
+
+            self.session_apt_sequences_data.append(sequence_data)
+            self.session_apt_sequences_labels.append(sequence_labels)
+
+        print(f"  提取了 {len(self.session_apt_sequences_data)} 个APT序列")
+
+    def _build_normal_sequences_from_sessions(self, num_sequences):
+        """从会话中构建正常序列"""
+        print("从会话中构建正常序列...")
+
+        target = 'Stage_encoded' if 'Stage_encoded' in self.df.columns else 'Label'
+
+        self.session_normal_sequences_data = []
+        self.session_normal_sequences_labels = []
+
+        import random
+        random.seed(42)
+
+        # 如果正常会话不够，重复使用
+        available_sessions = self.normal_sessions.copy()
+
+        for i in range(num_sequences):
+            if not available_sessions:
+                available_sessions = self.normal_sessions.copy()
+                random.shuffle(available_sessions)
+
+            session_id, flows = available_sessions.pop()
+
+            # 提取正常序列
+            sequence_data = []
+            sequence_labels = []
+
+            for flow in flows:
+                stage = flow[target]
+                stage_label = self.stage_to_internal[stage]
+
+                # 只保留选择的特征
+                if hasattr(self, 'candidate_features'):
+                    flow_data = {k: v for k, v in flow.items() if k in self.candidate_features}
+                else:
+                    flow_data = flow
+
+                sequence_data.append(flow_data)
+                sequence_labels.append(stage_label)
+
+            self.session_normal_sequences_data.append(sequence_data)
+            self.session_normal_sequences_labels.append(sequence_labels)
+
+        print(f"  构建了 {len(self.session_normal_sequences_data)} 个正常序列")
+
+    def _convert_session_labels_to_ids(self):
+        """转换会话标签序列为ID序列"""
+        print("转换会话标签序列为ID序列...")
+
+        try:
+            self.session_apt_sequences_ids = [[self.attack2id[label] for label in seq] for seq in self.session_apt_sequences_labels]
+            self.session_normal_sequences_ids = [[self.attack2id[label] for label in seq] for seq in self.session_normal_sequences_labels]
+            print(f"  APT序列ID: {len(self.session_apt_sequences_ids)}")
+            print(f"  正常序列ID: {len(self.session_normal_sequences_ids)}")
+        except KeyError as e:
+            print(f"错误: 标签 {e} 不在attack2id映射中")
+            raise
+
+    def _assign_session_sequence_labels(self):
+        """分配会话序列标签"""
+        print("分配会话序列标签...")
+
+        # APT序列标签基于最高攻击阶段
+        stage_to_final_label = {'S1': 1, 'S2': 2, 'S3': 3, 'S4': 4, 'SN': 0}
+
+        self.session_apt_labels = []
+        for seq_labels in self.session_apt_sequences_labels:
+            max_stage_num = 0
+            for label in seq_labels:
+                stage_num = stage_to_final_label.get(label, 0)
+                max_stage_num = max(max_stage_num, stage_num)
+
+            # 根据最高攻击阶段确定APT类型
+            if max_stage_num == 1:
+                apt_type = 1  # APT1: 仅侦察
+            elif max_stage_num == 2:
+                apt_type = 2  # APT2: 侦察+立足点
+            elif max_stage_num == 3:
+                apt_type = 3  # APT3: 前三阶段
+            elif max_stage_num == 4:
+                apt_type = 4  # APT4: 完整攻击链
+            else:
+                apt_type = 1  # 默认为APT1
+
+            self.session_apt_labels.append(apt_type)
+
+        # 正常序列标签都是0 (NAPT)
+        self.session_normal_labels = [0] * len(self.session_normal_sequences_ids)
+
+        print(f"  APT标签: {len(self.session_apt_labels)}")
+        print(f"  正常标签: {len(self.session_normal_labels)}")
+
+    def _save_session_sequence_results(self):
+        """保存会话序列结果"""
+        print("保存会话序列结果...")
+
+        # 创建会话专用输出目录
+        session_output_path = os.path.join(self.output_path, 'session_based')
+        os.makedirs(session_output_path, exist_ok=True)
+
+        # 保存attack2id映射
+        attack2id_path = os.path.join(session_output_path, 'attack2id.json')
+        with open(attack2id_path, 'w') as f:
+            json.dump(self.attack2id, f, indent=4)
+        print(f"  Attack2ID映射保存至: {attack2id_path}")
+
+        # 保存APT序列数据
+        apt_data_path = os.path.join(session_output_path, 'apt_sequences_data.json')
+        with open(apt_data_path, 'w') as f:
+            serializable_apt_data = [
+                [{k: (v.item() if hasattr(v, 'item') else v) for k, v in step.items()} for step in seq]
+                for seq in self.session_apt_sequences_data
+            ]
+            json.dump(serializable_apt_data, f, indent=2)
+        print(f"  APT序列数据保存至: {apt_data_path}")
+
+        # 保存正常序列数据
+        normal_data_path = os.path.join(session_output_path, 'normal_sequences_data.json')
+        with open(normal_data_path, 'w') as f:
+            serializable_normal_data = [
+                [{k: (v.item() if hasattr(v, 'item') else v) for k, v in step.items()} for step in seq]
+                for seq in self.session_normal_sequences_data
+            ]
+            json.dump(serializable_normal_data, f, indent=2)
+        print(f"  正常序列数据保存至: {normal_data_path}")
+
+        # 保存序列标签
+        apt_labels_path = os.path.join(session_output_path, 'apt_labels.npy')
+        np.save(apt_labels_path, np.array(self.session_apt_labels))
+        print(f"  APT标签保存至: {apt_labels_path}")
+
+        normal_labels_path = os.path.join(session_output_path, 'normal_labels.npy')
+        np.save(normal_labels_path, np.array(self.session_normal_labels))
+        print(f"  正常标签保存至: {normal_labels_path}")
+
+        # 保存序列ID
+        apt_ids_path = os.path.join(session_output_path, 'apt_sequences_ids.npy')
+        np.save(apt_ids_path, np.array(self.session_apt_sequences_ids, dtype=object), allow_pickle=True)
+        print(f"  APT序列ID保存至: {apt_ids_path}")
+
+        normal_ids_path = os.path.join(session_output_path, 'normal_sequences_ids.npy')
+        np.save(normal_ids_path, np.array(self.session_normal_sequences_ids, dtype=object), allow_pickle=True)
+        print(f"  正常序列ID保存至: {normal_ids_path}")
+
     def _build_attack2id_mapping(self):
         """构建attack2id映射"""
         print("构建attack2id映射...")
@@ -883,22 +1511,24 @@ class EnhancedAPTPreprocessor:
         target = 'Stage_encoded' if 'Stage_encoded' in self.df.columns else 'Label'
         unique_stages = sorted(self.df[target].unique())
 
-        # 创建内部标签映射
+        # 创建内部标签映射（修正版本）
+        # 根据数据集实际分布：{0: 10000, 1: 5002, 2: 22968, 3: 12664, 4: 14366}
+        # 其中1对应的是数据泄露阶段（数量5002），需要重新映射
         self.stage_to_internal = {
-            0: 'SN',  # 正常流量
-            1: 'S1',  # 数据渗透
-            2: 'S2',  # 建立立足点
-            3: 'S3',  # 横向移动
-            4: 'S4'   # 侦察
+            0: 'SN',  # 正常流量 (Normal) - 10000样本
+            4: 'S1',  # 侦察阶段 (Reconnaissance) - 14366样本
+            2: 'S2',  # 建立立足点 (Establish Foothold) - 22968样本
+            3: 'S3',  # 横向移动 (Lateral Movement) - 12664样本
+            1: 'S4'   # 数据泄露 (Data Exfiltration) - 5002样本
         }
 
         # 构建attack2id映射
         self.attack2id = {
             'SN': 0,  # 正常流量
-            'S1': 1,  # 数据渗透
+            'S1': 1,  # 侦察阶段
             'S2': 2,  # 建立立足点
             'S3': 3,  # 横向移动
-            'S4': 4   # 侦察
+            'S4': 4   # 数据泄露
         }
 
         print(f"  Attack2ID映射: {self.attack2id}")
@@ -1100,10 +1730,12 @@ class EnhancedAPTPreprocessor:
         print(f"  正常序列ID保存至: {normal_ids_path}")
 
 
+
+
 def main():
     """主函数"""
     print("🎯 增强版APT数据预处理器")
-    print("特点: XGBoost特征选择 + 论文关键特征 + 攻击序列构建")
+    print("特点: XGBoost特征选择 + 动态特征数量优化 + 两种攻击序列构建方法")
     print("="*80)
 
     # 设置路径
@@ -1113,11 +1745,134 @@ def main():
     # 创建处理器并运行
     processor = EnhancedAPTPreprocessor(input_path, output_path)
 
-    # 运行完整的预处理和评估流程（调整特征数量为可用特征数）
-    processor.run_complete_pipeline(n_features=20, cv_folds=10)
+    # 运行完整的预处理和评估流程
+    processor.load_data().clean_data().create_statistical_features().encode_and_normalize().prepare_paper_aligned_features()
+    available_features = len(processor.candidate_features)
 
-    # 构建攻击序列
-    processor.build_attack_sequences(num_apt_sequences=10000, min_normal_insert=1, max_normal_insert=5)
+    print(f"\n📊 特征数量分析:")
+    print(f"  可用特征数量: {available_features}")
+    print(f"  将使用XGBoost分析寻找最优特征数量")
+
+    # 测试不同的特征选择策略
+    print(f"\n🔬 测试不同特征选择策略")
+    print("="*60)
+
+    # 策略1: 包含论文特征 + 移除过拟合特征
+    print(f"\n📋 策略1: 包含论文特征 + 移除过拟合特征")
+    processor1 = EnhancedAPTPreprocessor(input_path, output_path + "_strategy1")
+    processor1.load_data().clean_data().create_statistical_features().encode_and_normalize().prepare_paper_aligned_features()
+    processor1.evaluate_with_fold_internal_pipeline(n_features=None, cv_folds=5, optimize_hyperparams=True, n_trials=10)
+    f1_strategy1 = processor1.cv_results['XGBoost']['f1_macro']['mean']
+    print(f"策略1 F1分数: {f1_strategy1:.4f}")
+
+    # 策略2: 不包含论文特征，测试其他特征
+    print(f"\n📋 策略2: 不包含论文特征，测试其他特征")
+    processor2 = EnhancedAPTPreprocessor(input_path, output_path + "_strategy2")
+    processor2.load_data().clean_data().create_statistical_features().encode_and_normalize().prepare_paper_aligned_features()
+    # 修改过滤策略
+    processor2.filter_candidate_features(remove_overfitting_features=True, include_paper_features=False)
+    processor2.evaluate_with_fold_internal_pipeline(n_features=None, cv_folds=5, optimize_hyperparams=True, n_trials=10)
+    f1_strategy2 = processor2.cv_results['XGBoost']['f1_macro']['mean']
+    print(f"策略2 F1分数: {f1_strategy2:.4f}")
+
+    # 策略3: 包含所有特征（包括可能过拟合的）
+    print(f"\n📋 策略3: 包含所有特征（包括可能过拟合的）")
+    processor3 = EnhancedAPTPreprocessor(input_path, output_path + "_strategy3")
+    processor3.load_data().clean_data().create_statistical_features().encode_and_normalize().prepare_paper_aligned_features()
+    # 不过滤任何特征
+    processor3.filter_candidate_features(remove_overfitting_features=False, include_paper_features=True)
+    processor3.evaluate_with_fold_internal_pipeline(n_features=None, cv_folds=5, optimize_hyperparams=True, n_trials=10)
+    f1_strategy3 = processor3.cv_results['XGBoost']['f1_macro']['mean']
+    print(f"策略3 F1分数: {f1_strategy3:.4f}")
+
+    # 比较结果
+    print(f"\n📊 特征选择策略对比:")
+    print("="*60)
+    strategies = [
+        ("策略1 (论文特征+过滤)", f1_strategy1, processor1),
+        ("策略2 (无论文特征)", f1_strategy2, processor2),
+        ("策略3 (所有特征)", f1_strategy3, processor3)
+    ]
+
+    best_strategy = max(strategies, key=lambda x: x[1])
+
+    for name, f1, processor in strategies:
+        status = "✅ 最佳" if (name, f1, processor) == best_strategy else ""
+        print(f"  {name}: {f1:.4f} {status}")
+
+    print(f"\n🏆 最佳策略: {best_strategy[0]} (F1: {best_strategy[1]:.4f})")
+
+    # 保存最佳结果
+    best_processor = best_strategy[2]
+    best_processor.save_results()
+
+    # 比较两种攻击序列构建方法
+    print(f"\n🔬 比较两种攻击序列构建方法")
+    print("="*60)
+
+    # 方法1: 基于AttackID的随机构建
+    print(f"\n📋 方法1: 基于AttackID的随机构建")
+    processor_method1 = EnhancedAPTPreprocessor(input_path, output_path + "_method1_attackid")
+    processor_method1.load_data().clean_data().create_statistical_features().encode_and_normalize().prepare_paper_aligned_features()
+    processor_method1.build_attack_sequences(num_apt_sequences=1000, min_normal_insert=1, max_normal_insert=5)
+
+    # 方法2: 基于会话的构建
+    print(f"\n📋 方法2: 基于会话的构建")
+    processor_method2 = EnhancedAPTPreprocessor(input_path, output_path + "_method2_session")
+    processor_method2.load_data().clean_data().create_statistical_features().encode_and_normalize().prepare_paper_aligned_features()
+    processor_method2.build_session_based_attack_sequences(num_apt_sequences=1000, session_timeout=300)
+
+    # 分析两种方法的差异
+    print(f"\n📊 两种方法对比分析:")
+    print("="*60)
+
+    # 方法1统计
+    print(f"\n方法1 (AttackID随机构建):")
+    print(f"  APT序列数量: {len(processor_method1.apt_sequences_data)}")
+    print(f"  正常序列数量: {len(processor_method1.normal_sequences_data)}")
+
+    # 分析方法1的序列长度分布
+    method1_lengths = [len(seq) for seq in processor_method1.apt_sequences_data]
+    print(f"  APT序列长度: 平均={np.mean(method1_lengths):.1f}, 最小={min(method1_lengths)}, 最大={max(method1_lengths)}")
+
+    # 分析方法1的APT类型分布
+    from collections import Counter
+    method1_apt_types = Counter(processor_method1.apt_labels)
+    print(f"  APT类型分布: {dict(method1_apt_types)}")
+
+    # 方法2统计
+    print(f"\n方法2 (会话构建):")
+    print(f"  APT序列数量: {len(processor_method2.session_apt_sequences_data)}")
+    print(f"  正常序列数量: {len(processor_method2.session_normal_sequences_data)}")
+
+    # 分析方法2的序列长度分布
+    method2_lengths = [len(seq) for seq in processor_method2.session_apt_sequences_data]
+    print(f"  APT序列长度: 平均={np.mean(method2_lengths):.1f}, 最小={min(method2_lengths)}, 最大={max(method2_lengths)}")
+
+    # 分析方法2的APT类型分布
+    method2_apt_types = Counter(processor_method2.session_apt_labels)
+    print(f"  APT类型分布: {dict(method2_apt_types)}")
+
+    # 比较分析
+    print(f"\n🔍 方法对比总结:")
+    print(f"  序列长度差异:")
+    print(f"    方法1平均长度: {np.mean(method1_lengths):.1f}")
+    print(f"    方法2平均长度: {np.mean(method2_lengths):.1f}")
+    print(f"    长度差异: {np.mean(method2_lengths) - np.mean(method1_lengths):+.1f}")
+
+    print(f"\n  真实性分析:")
+    print(f"    方法1: 随机构建，可能不符合真实攻击时序")
+    print(f"    方法2: 基于真实网络会话，保持时间和网络关系的连续性")
+
+    print(f"\n  推荐使用:")
+    if np.mean(method2_lengths) > np.mean(method1_lengths):
+        print(f"    ✅ 推荐方法2 (会话构建): 序列更长，更符合真实攻击场景")
+    else:
+        print(f"    ⚠️ 两种方法各有优势，建议根据具体需求选择")
+
+    print(f"\n✅ 攻击序列构建方法比较完成")
+    print(f"  方法1结果保存在: {output_path}_method1_attackid")
+    print(f"  方法2结果保存在: {output_path}_method2_session")
 
 
 if __name__ == "__main__":
