@@ -1,774 +1,896 @@
-import numpy as np 
-import pandas as pd 
-import matplotlib.pyplot as plt
-import seaborn as sns
-import itertools
-import random
 import os
-from datetime import datetime
-from sklearn.preprocessing import LabelEncoder, MinMaxScaler
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.impute import SimpleImputer as Imputer
-from sklearn.metrics import confusion_matrix, accuracy_score, precision_recall_fscore_support, roc_curve, f1_score
-from sklearn.model_selection import train_test_split
-from sklearn.feature_selection import mutual_info_classif, SelectKBest
-from math import ceil
-import keras
-from keras.models import Model, Sequential
-from keras.layers import Dense
-import tensorflow as tf
-from tensorflow.keras.utils import to_categorical
-# import eli5
-import joblib
+import pandas as pd
+import numpy as np
+import random
+# import re # No longer needed for filename extraction
+import time
+from collections import defaultdict
+# from sklearn.preprocessing import LabelEncoder # Might be useful later if encoding features
+from sklearn.feature_selection import mutual_info_classif
+import warnings
+import json  # For potentially saving map
 
-# 在文件开头定义标签映射
-# 更新标签映射，确保与apt_sequence_builder.py中的标签定义一致
-label_d = {
-    "BENIGN": 0,  
-    "Reconnaissance": 1,
-    "Establish Foothold": 2,
-    "Lateral Movement": 3,
-    "Data Exfiltration": 4
+# Ignore SettingWithCopyWarning for cleaner output during per-stage processing
+warnings.filterwarnings('ignore', category=pd.errors.SettingWithCopyWarning)
+
+# Define standard column names based on user provided list
+USER_PROVIDED_COLUMNS = [
+    'Flow ID', 'Src IP', 'Src Port', 'Dst IP', 'Dst Port', 'Protocol', 'Timestamp', 'Flow Duration',
+    'Total Fwd Packet', 'Total Bwd packets', 'Total Length of Fwd Packet', 'Total Length of Bwd Packet',
+    'Fwd Packet Length Max', 'Fwd Packet Length Min', 'Fwd Packet Length Mean', 'Fwd Packet Length Std',
+    'Bwd Packet Length Max', 'Bwd Packet Length Min', 'Bwd Packet Length Mean', 'Bwd Packet Length Std',
+    'Flow Bytes/s', 'Flow Packets/s', 'Flow IAT Mean', 'Flow IAT Std', 'Flow IAT Max', 'Flow IAT Min',
+    'Fwd IAT Total', 'Fwd IAT Mean', 'Fwd IAT Std', 'Fwd IAT Max', 'Fwd IAT Min',
+    'Bwd IAT Total', 'Bwd IAT Mean', 'Bwd IAT Std', 'Bwd IAT Max', 'Bwd IAT Min',
+    'Fwd PSH Flags', 'Bwd PSH Flags', 'Fwd URG Flags', 'Bwd URG Flags', 'Fwd Header Length', 'Bwd Header Length',
+    'Fwd Packets/s', 'Bwd Packets/s', 'Packet Length Min', 'Packet Length Max', 'Packet Length Mean',
+    'Packet Length Std', 'Packet Length Variance', 'FIN Flag Count', 'SYN Flag Count', 'RST Flag Count',
+    'PSH Flag Count', 'ACK Flag Count', 'URG Flag Count', 'CWR Flag Count', 'ECE Flag Count',
+    'Down/Up Ratio', 'Average Packet Size', 'Fwd Segment Size Avg', 'Bwd Segment Size Avg',
+    'Fwd Bytes/Bulk Avg', 'Fwd Packet/Bulk Avg', 'Fwd Bulk Rate Avg', 'Bwd Bytes/Bulk Avg',
+    'Bwd Packet/Bulk Avg', 'Bwd Bulk Rate Avg', 'Subflow Fwd Packets', 'Subflow Fwd Bytes',
+    'Subflow Bwd Packets', 'Subflow Bwd Bytes', 'FWD Init Win Bytes', 'Bwd Init Win Bytes',
+    'Fwd Act Data Pkts', 'Fwd Seg Size Min', 'Active Mean', 'Active Std', 'Active Max', 'Active Min',
+    'Idle Mean', 'Idle Std', 'Idle Max', 'Idle Min', 'Activity', 'Stage'  # User confirmed 'Stage' is the label column
+]
+
+# Mapping from original stage names to internal keys used for sequence generation
+# And reverse mapping
+INTERNAL_STAGE_MAP = {
+    'Reconnaissance': 'S1',
+    'Establish Foothold': 'S2',
+    'Lateral Movement': 'S3',
+    'Data Exfiltration': 'S4',  # 对应 "窃取信息或破坏系统"
+    # 'Persistence'/'Cleanup' or similar for S5? - Not found in this run's data
+    '正常流量': 'SN'  # 统一后的正常流量
 }
+REVERSE_STAGE_MAP = {v: k for k, v in INTERNAL_STAGE_MAP.items()}
 
-# 反向映射
-label_id_to_name = {v: k for k, v in label_d.items()}
 
-def datetime_to_timestamp(dt):
-    try:
-        return datetime.strptime(dt, '%m/%d/%Y %H:%M').weekday()
-    except:
-        return datetime.strptime(dt, '%Y-%m-%d %H:%M:%S').weekday()
-    
-def clean_dataset(df):
-    """
-    清理数据集，处理缺失值和异常值
-    
-    参数:
-    df: 数据框
-    
-    返回:
-    清理后的数据框
-    """
-    assert isinstance(df, pd.DataFrame), "df needs to be a pd.DataFrame"
-    
-    # 删除包含NaN的行
-    df = df.dropna()
-    
-    # 识别数值列
-    numeric_cols = df.select_dtypes(include=['number']).columns
-    
-    if len(numeric_cols) > 0:
-        # 只对数值列检查无穷值
-        numeric_df = df[numeric_cols]
-        indices_to_keep = ~numeric_df.isin([np.nan, np.inf, -np.inf]).any(axis=1)
-        df = df.loc[indices_to_keep]
-    
-    return df
+class DAPTPreprocessor:
+    def __init__(self, csv_dir_path, output_path):
+        if not os.path.isdir(csv_dir_path):
+            raise ValueError(f"Provided path is not a valid directory: {csv_dir_path}")
+        self.csv_dir_path = csv_dir_path
+        self.output_path = output_path
+        os.makedirs(self.output_path, exist_ok=True)  # Ensure output dir exists
+        self.data_frames = {}  # Stores DataFrames keyed by unified stage name (e.g., '侦察', '正常流量')
+        self.selected_features = None  # List of feature names after GLOBAL cleaning/selection
+        self.dimension_tracking = {}  # Tracks dimensions per stage: {'StageName': {'Original': X, 'Cleaned': Y, 'Selected': Z}}
 
-def train_test_dataset(df_train, df_test, deep=True):
-    labelencoder = LabelEncoder()
-    X_train = df_train.drop(columns=['Label']).copy()
-    y_train = df_train.iloc[:, -1].values.reshape(-1,1).copy()
-    y_train = np.ravel(y_train).copy()
-    if deep:
-        y_train = to_categorical(y_train)
-    
-    if df_test is not None:
-        X_test = df_test.drop(columns=['Label']).copy()
-        y_test = df_test.iloc[:, -1].values.reshape(-1,1).copy()
-        y_test = np.ravel(y_test).copy()
-        if deep:
-            y_test = to_categorical(y_test)
-        return X_train, X_test, y_train, y_test
-    else:
-        return train_test_split(X_train, y_train)
-    
-def show_cm(cm):
-    f, ax = plt.subplots(figsize=(5,5))
-    sns.heatmap(cm, annot=True, linewidth=0.5, linecolor="red", fmt=".0f", ax=ax)
-    plt.xlabel("y_pred")
-    plt.ylabel("y_true")
-    plt.show()
+        # Sequence related attributes
+        self.apt_sequences_labels = []  # List of lists containing stage labels (e.g., ['S1', 'SN', 'S2', ...])
+        self.normal_sequences_labels = []  # List of lists containing stage labels (e.g., ['SN', 'SN', ...])
+        self.apt_sequences_data = []  # List of sequence data (e.g., list of numpy arrays or dataframes)
+        self.normal_sequences_data = []  # List of sequence data
+        self.attack2id = {}  # Mapping from internal stage label ('S1'-SN') to integer ID
+        self.apt_sequences_ids = []  # List of lists containing integer IDs for APT seqs
+        self.normal_sequences_ids = []  # List of lists containing integer IDs for Normal seqs
+        self.apt_labels = []  # Final labels (1-5) for APT sequences
+        self.normal_labels = []  # Final labels (0) for Normal sequences
 
-def from_categorical(y_):
-    return np.array([np.argmax(i) for i in y_])
-
-def discretize(a):
-    return 1 if a > 0.5 else 0
-
-def labels_to_numbers(df: pd.DataFrame, name='Label'):
-    labels = df[name].unique()
-    d = {label: idx for idx, label in enumerate(labels)}
-    return d
-
-def number_to_label(df, number, name='Label'):
-    labels = df[name].unique()
-    d = {idx: label for idx, label in enumerate(labels)}
-    return d[number]
-        
-def prepare_df(df: pd.DataFrame, dropcols=None, scaler=None, ldict=None):
-    """
-    准备数据集，包括删除列、标准化和标签编码
-    
-    参数:
-    df: 数据框
-    dropcols: 要删除的列列表
-    scaler: 标准化方法，'minmax'或'standard'
-    ldict: 标签字典
-    
-    返回:
-    准备好的数据框
-    """
-    temp_df = df.copy()
-    session_id_col = 'Session_ID'
-    # 删除指定的列，但强制保留Session_ID
-    if dropcols:
-        dropcols_ = [col for col in dropcols if col != session_id_col]
-        temp_df = temp_df.drop(columns=dropcols_, errors='ignore')
-    # 如果Session_ID丢失且原始df有，则补回
-    if session_id_col not in temp_df.columns and session_id_col in df.columns:
-        temp_df[session_id_col] = df[session_id_col]
-    # 将标签映射到数字
-    if not ldict:
-        ltn_dict = labels_to_numbers(temp_df)
-    else:
-        ltn_dict = ldict
-    temp_df['Label'] = temp_df['Label'].map(ltn_dict)
-    # 清理数据集
-    temp_df = clean_dataset(temp_df)
-    # 识别数值列（排除Label和非数值列）
-    numeric_cols = temp_df.select_dtypes(include=['number']).columns.tolist()
-    if 'Label' in numeric_cols:
-        numeric_cols.remove('Label')
-    # 标准化数值列
-    if scaler == 'minmax':
-        scaler = MinMaxScaler()
-    elif scaler == 'standard':
-        from sklearn.preprocessing import StandardScaler
-        scaler = StandardScaler()
-    if scaler and numeric_cols:
-        temp_df[numeric_cols] = scaler.fit_transform(temp_df[numeric_cols])
-    return temp_df
-
-def encode_categorical_features(df):
-    """
-    对非数值特征进行编码
-    
-    参数:
-    df: 数据框
-    
-    返回:
-    编码后的数据框和编码器字典
-    """
-    result_df = df.copy()
-    encoders = {}
-    
-    # 识别非数值列
-    non_numeric_cols = df.select_dtypes(exclude=['number']).columns.tolist()
-    
-    for col in non_numeric_cols:
-        # 使用LabelEncoder对非数值特征进行编码
-        le = LabelEncoder()
-        result_df[col] = le.fit_transform(df[col].astype(str))
-        encoders[col] = le
-        
-    return result_df, encoders
-
-def binarize_label(y, label):
-    idx = y == label
-    y[idx] = 1
-    y[~idx] = 0
-    
-def evaluate_model(model, df, binarize=None):
-    X = df.drop(columns=['Label']).copy()
-    y = df.iloc[:, -1].values.reshape(-1,1).copy()
-    y = np.ravel(y).copy()
-    if binarize is not None:
-        binarize_label(y, binarize)
-    
-    model.evaluate(X, y)
-    
-    y_predicted = model.predict(X)
-    cm = confusion_matrix(y, vdiscretize(y_predicted))
-    show_cm(cm)
-    
-def unsup_compare_results(model, X, y_true):
-    y_pred = model.predict(X)
-    return f1_score(y_true, y_pred, average=None)
-
-def plot_cm(model, X, y_true):
-    y_pred = model.predict(X)
-    cm = confusion_matrix(y_true, y_pred)
-    show_cm(cm)
-    
-def make_binary_svm(train, test, l):
-    """
-    创建二分类SVM的数据集
-    
-    参数:
-    train: 训练数据集
-    test: 测试数据集
-    l: 目标标签
-    
-    返回:
-    训练特征、测试特征、训练标签、测试标签
-    """
-    _X_train, _X_test, _y_train, _y_test = train_test_split(train, test, deep=False)
-    binarize_label(_y_train, l)
-    binarize_label(_y_test, l)
-    # _y_train[_y_train == 0] = -1
-    # _y_train[_y_train == 0] = -1
-    return _X_train, _X_test, _y_train, _y_test
-
-def check_all_labels(train, test, model_constructor, l_name='Label', constructor_kwargs=None):
-    labels = train[l_name].unique()
-    for label in labels:
-        print(f'============= Label {number_to_label(clean_test, label)} ==================')
-        X_train, X_test, y_train, y_test = make_binary_svm(clean_train, clean_test, label)
-        if constructor_kwargs:
-            model = model_constructor(**constructor_kwargs)
-        else:
-            model = model_constructor()
-        model.fit(X_train, y_train)
-        print(unsup_compare_results(model, X_test, y_test))
-        probs = model.predict_proba(X_test)[:, 1]
-        plot_roc(y_test, probs)
-        
-def plot_roc(y, probs, label='Classifier'):
-    ns_probs = [0 for _ in range(len(y))]
-    
-    ns_fpr, ns_tpr, _ = roc_curve(y, ns_probs)
-    fpr, tpr, _ = roc_curve(y, probs)
-    plt.plot(ns_fpr, ns_tpr, linestyle='--', label='No Skill')
-    plt.plot(fpr, tpr, label=label)
-    # plt.ylim([0.0, 1.05])
-    # plt.xlim([0.0, 1.05])
-    plt.legend()
-    plt.show()
-        
-vdiscretize = np.vectorize(discretize)
-
-def display_class_metrics(y_true, y_pred, drev, name=""):
-    """显示每个类别的评估指标"""
-    print(f"\n=== {name}每个类别的F1分数 ===")
-    class_precision, class_recall, class_f1, class_support = precision_recall_fscore_support(y_true, y_pred)
-    
-    # 获取所有可能的类别ID
-    all_classes = sorted(set(y_true) | set(y_pred))
-    
-    # 创建结果字典，包含所有类别
-    results = {}
-    
-    # 确保包含所有在字典中定义的类别
-    for class_id in drev.keys():
-        results[class_id] = {
-            'name': drev.get(class_id, f"未知类别-{class_id}"),
-            'f1': 0.0,
-            'support': 0
-        }
-    
-    # 填充实际计算的F1分数
-    for i, class_id in enumerate(sorted(set(y_true) | set(y_pred))):
-        if i < len(class_f1):
-            class_name = drev.get(int(class_id), f"未知类别-{class_id}")
-            results[int(class_id)] = {
-                'name': class_name,
-                'f1': class_f1[i],
-                'support': class_support[i]
-            }
-    
-    # 按类别ID排序并显示结果
-    for class_id in sorted(results.keys()):
-        result = results[class_id]
-        print(f"类别 {class_id} ({result['name']}): F1={result['f1']:.4f}, 支持度={result['support']}")
-    
-    return results
-
-def sort_by_timestamp(df, timestamp_col='Timestamp'):
-    """
-    按时间戳对数据进行排序
-    
-    参数:
-    df: 数据框
-    timestamp_col: 时间戳列名
-    
-    返回:
-    排序后的数据框
-    """
-    if timestamp_col not in df.columns:
-        print(f"警告: 数据集中没有'{timestamp_col}'列，无法按时间戳排序")
-        return df
-    
-    # 尝试将时间戳转换为datetime格式
-    try:
-        df[timestamp_col] = pd.to_datetime(df[timestamp_col])
-    except Exception as e:
-        print(f"警告: 时间戳转换失败，将按原始格式排序。错误: {e}")
-    
-    # 按时间戳排序
-    sorted_df = df.sort_values(by=timestamp_col)
-    print(f"数据已按'{timestamp_col}'列排序")
-    
-    return sorted_df
-
-def merge_by_identifiers(dataframes, identifiers=['Src IP', 'Dst IP', 'Src Port', 'Dst Port', 'Protocol'], time_window_seconds=60):
-    """
-    根据共同的事件标识符合并多个数据框，并考虑时间窗口
-    
-    参数:
-    dataframes: 数据框列表
-    identifiers: 用于合并的标识符列表
-    time_window_seconds: 时间窗口（秒），超过此时间窗口的记录即使标识符相同也被视为不同事件
-    
-    返回:
-    合并后的数据框
-    """
-    if not dataframes:
-        print("没有数据框可合并")
-        return None
-    
-    # 检查所有数据框是否都包含所有标识符
-    for i, df in enumerate(dataframes):
-        missing_cols = [col for col in identifiers if col not in df.columns]
-        if missing_cols:
-            print(f"警告: 数据框 {i} 缺少以下标识符列: {missing_cols}")
-            print("将使用所有数据框共有的列进行合并")
-            identifiers = [col for col in identifiers if col not in missing_cols]
-    
-    if not identifiers:
-        print("没有共同的标识符列可用于合并")
-        print("将直接连接所有数据框")
-        return pd.concat(dataframes)
-    
-    print(f"使用以下标识符合并数据: {identifiers}")
-    
-    # 合并数据框
-    merged_df = pd.concat(dataframes)
-    
-    # 确保有时间戳列
-    timestamp_col = 'Timestamp'
-    if timestamp_col in merged_df.columns:
-        # 转换时间戳为datetime格式
-        try:
-            merged_df[timestamp_col] = pd.to_datetime(merged_df[timestamp_col])
-            
-            # 检查是否有重复的行（基于标识符）
-            duplicates = merged_df.duplicated(subset=identifiers, keep=False)
-            if duplicates.any():
-                print(f"发现 {duplicates.sum()} 行潜在重复数据（基于标识符）")
-                print(f"应用时间窗口 {time_window_seconds} 秒进行智能去重")
-                
-                # 按标识符和时间戳排序
-                merged_df = merged_df.sort_values(by=identifiers + [timestamp_col])
-                
-                # 创建一个标志列，标记要保留的行
-                merged_df['keep'] = True
-                
-                # 获取唯一的标识符组合
-                grouped = merged_df.groupby(identifiers)
-                
-                # 对每个组应用时间窗口去重
-                for name, group in grouped:
-                    if len(group) > 1:
-                        # 按时间戳排序
-                        sorted_group = group.sort_values(by=timestamp_col)
-                        
-                        # 计算时间差
-                        time_diffs = sorted_group[timestamp_col].diff().dt.total_seconds()
-                        
-                        # 第一行总是保留
-                        keep_mask = [True] * len(sorted_group)
-                        
-                        # 检查每行与前一行的时间差
-                        for i in range(1, len(sorted_group)):
-                            # 如果时间差小于窗口且前一行被保留，则当前行不保留
-                            if time_diffs.iloc[i] < time_window_seconds and keep_mask[i-1]:
-                                keep_mask[i] = False
-                                
-                                # 检查是否有不同的Label值，如果有则保留
-                                if 'Label' in sorted_group.columns:
-                                    current_label = sorted_group['Label'].iloc[i]
-                                    prev_label = sorted_group['Label'].iloc[i-1]
-                                    if current_label != prev_label:
-                                        keep_mask[i] = True
-                                        
-                                # 检查是否有Reconnaisance标签，如果有则保留
-                                if 'Label' in sorted_group.columns:
-                                    if sorted_group['Label'].iloc[i] == 'Reconnaisance':
-                                        keep_mask[i] = True
-                        
-                        # 更新keep标志
-                        sorted_group_indices = sorted_group.index
-                        for i, idx in enumerate(sorted_group_indices):
-                            merged_df.loc[idx, 'keep'] = keep_mask[i]
-                
-                # 只保留标记为keep=True的行
-                before_count = len(merged_df)
-                merged_df = merged_df[merged_df['keep']].drop(columns=['keep'])
-                after_count = len(merged_df)
-                print(f"智能去重后保留了 {after_count} 行，删除了 {before_count - after_count} 行")
-                
-                # 检查是否有Reconnaisance类别
-                if 'Label' in merged_df.columns:
-                    recon_count = (merged_df['Label'] == 'Reconnaisance').sum()
-                    print(f"去重后保留了 {recon_count} 行Reconnaisance类别数据")
-            else:
-                print("没有发现重复数据")
-        except Exception as e:
-            print(f"应用时间窗口去重时出错: {e}")
-            print("将使用标准去重方法")
-            
-            # 检查是否有重复的行（基于标识符）
-            duplicates = merged_df.duplicated(subset=identifiers, keep=False)
-            if duplicates.any():
-                print(f"发现 {duplicates.sum()} 行重复数据（基于标识符）")
-                print("保留第一次出现的行")
-                merged_df = merged_df.drop_duplicates(subset=identifiers, keep='first')
-    else:
-        print(f"警告: 数据集中没有'{timestamp_col}'列，无法应用时间窗口去重")
-        print("将使用标准去重方法")
-        
-        # 检查是否有重复的行（基于标识符）
-        duplicates = merged_df.duplicated(subset=identifiers, keep=False)
-        if duplicates.any():
-            print(f"发现 {duplicates.sum()} 行重复数据（基于标识符）")
-            print("保留第一次出现的行")
-            merged_df = merged_df.drop_duplicates(subset=identifiers, keep='first')
-    
-    return merged_df
-
-frames = []
-
-def remove_correlated_features(df, threshold=0.9):
-    """
-    移除高度相关的特征（皮尔逊相关系数大于阈值）
-    
-    参数:
-    df: 数据框
-    threshold: 相关系数阈值，默认为0.9
-    
-    返回:
-    移除高度相关特征后的数据框和被移除的特征列表
-    """
-    # 计算相关系数矩阵
-    corr_matrix = df.corr().abs()
-    
-    # 创建上三角矩阵（不包括对角线）
-    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-    
-    # 找出相关系数大于阈值的特征
-    to_drop = [column for column in upper.columns if any(upper[column] > threshold)]
-    
-    print(f"发现 {len(to_drop)} 个高度相关的特征（相关系数 > {threshold}）:")
-    for col in to_drop:
-        # 找出与该特征高度相关的其他特征
-        correlated_features = list(upper.index[upper[col] > threshold])
-        if correlated_features:
-            print(f"- {col} 与 {', '.join(correlated_features)} 高度相关")
-    
-    # 移除高度相关的特征
-    df_reduced = df.drop(columns=to_drop)
-    
-    print(f"移除高度相关特征后的数据形状: {df_reduced.shape}")
-    
-    return df_reduced, to_drop
-
-def select_features_by_mutual_info(X, y, k='all'):
-    """
-    使用互信息选择重要特征
-    
-    参数:
-    X: 特征数据框
-    y: 目标变量
-    k: 要选择的特征数量，默认为'all'（根据特征重要性排序但不减少特征数量）
-    
-    返回:
-    选择的特征数据框和特征重要性
-    """
-    # 创建SelectKBest对象
-    if k == 'all' or k >= X.shape[1]:
-        k = X.shape[1]
-    
-    # 使用互信息计算特征重要性
-    selector = SelectKBest(mutual_info_classif, k=k)
-    X_new = selector.fit_transform(X, y)
-    
-    # 获取特征重要性分数
-    scores = selector.scores_
-    
-    # 创建特征名称和重要性分数的映射
-    feature_importance = dict(zip(X.columns, scores))
-    
-    # 按重要性排序
-    sorted_features = sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)
-    
-    print(f"互信息特征选择结果（选择前 {k} 个特征）:")
-    for i, (feature, score) in enumerate(sorted_features[:k]):
-        print(f"{i+1}. {feature}: {score:.4f}")
-    
-    # 获取选择的特征名称
-    if k < X.shape[1]:
-        selected_indices = selector.get_support(indices=True)
-        selected_features = X.columns[selected_indices]
-        X_selected = X[selected_features]
-    else:
-        X_selected = X
-    
-    return X_selected, feature_importance
-
-# 主程序
-if __name__ == "__main__":
-    # 检查数据集路径是否存在
-    dataset_path = "D:/PycharmProjects/dapt2020/csv/"
-    
-    # 如果路径不存在，尝试其他可能的路径
-    if not os.path.exists(dataset_path):
-        print(f"警告: 找不到数据集路径 {dataset_path}")
-        print("尝试使用当前目录下的csv文件夹...")
-        
-        # 尝试当前目录下的csv文件夹
-        dataset_path = "./csv/"
-        if not os.path.exists(dataset_path):
-            print(f"警告: 找不到数据集路径 {dataset_path}")
-            print("尝试使用上级目录下的csv文件夹...")
-            
-            # 尝试上级目录下的csv文件夹
-            dataset_path = "../csv/"
-            if not os.path.exists(dataset_path):
-                print(f"错误: 无法找到有效的数据集路径")
-                print("请确保路径正确或修改代码中的路径")
-                exit(1)
-    
-    print(f"使用数据集路径: {dataset_path}")
-    print("开始加载DAPT2020数据集...")
-    frames = []
-    
-    # 更新数据集路径
-    for file in os.listdir(dataset_path):
-        if file.endswith(".csv"):
-            path = os.path.join(dataset_path, file)
-            print(f"加载文件: {file}")
-            try:
-                tmp = pd.read_csv(path)
-                frames.append(tmp)
-            except Exception as e:
-                print(f"加载文件 {file} 时出错: {e}")
-    
-    if not frames:
-        print("没有找到有效的CSV文件")
-        exit(1)
-        
-    print("合并数据集...")
-    # 根据共同的事件标识符合并数据
-    dapt2020 = merge_by_identifiers(frames)
-    dapt2020 = dapt2020.rename(columns={"Stage": "Label"})
-    
-    # === 修复点：如无Session_ID则自动生成 ===
-    if 'Session_ID' not in dapt2020.columns:
-        dapt2020 = dapt2020.reset_index(drop=True)
-        dapt2020['Session_ID'] = dapt2020.index.astype(str)
-    
-    # 按时间戳排序
-    print("按时间戳排序...")
-    dapt2020 = sort_by_timestamp(dapt2020)
-    
-    dapt_label_d = {
-        "Benign": 0,
-        'BENIGN': 0,
-        'Reconnaissance': 1,
-        'Establish Foothold': 2,
-        'Lateral Movement': 3,
-        'Data Exfiltration': 4
-    }
-    
-    print("预处理数据集...")
-    try:
-        # 定义可以安全删除的特征列表（经过重新评估，进一步减少）
-        safe_to_drop = [
-            'Flow ID',  # 唯一标识符，可以通过IP、端口和时间戳来关联事件
-            
-            # 只删除确定冗余的特征
-            'Packet Length Variance',  # 可以由Packet Length Std计算得出
-            'Down/Up Ratio'  # 可以由其他流量特征计算得出
+        # Define key features to exclude from correlation-based removal
+        # Updated based on user request
+        self.key_features = [
+            'Dst Port', 'Flow Duration', 'Total Fwd Packet', 'Total Bwd packets',
+            'Src IP', 'Dst IP', 'Total Length of Fwd Packet', 'Timestamp'
         ]
-        
-        # 检查要删除的列是否存在于数据集中
-        existing_columns = dapt2020.columns
-        dropcols = [col for col in safe_to_drop if col in existing_columns]
-        
-        # 打印将要删除的列
-        print(f"将要删除的列（{len(dropcols)}个）:")
-        for col in dropcols:
-            print(f"- {col}")
-        
-        # 打印保留的列
-        retained_cols = [col for col in existing_columns if col not in dropcols]
-        print(f"\n保留的列（{len(retained_cols)}个）:")
-        for col in retained_cols[:10]:  # 只打印前10个，避免输出过多
-            print(f"- {col}")
-        if len(retained_cols) > 10:
-            print(f"- ... 以及其他 {len(retained_cols) - 10} 个列")
-        
-        clean_dapt = prepare_df(dapt2020, dropcols=dropcols, scaler='standard', ldict=dapt_label_d)
-        drev = {val: key for key, val in dapt_label_d.items()}
-        
-        print("DAPT2020数据集预处理完成")
-        print(f"数据形状: {clean_dapt.shape}")
-        print(f"类别分布:\n{clean_dapt['Label'].value_counts()}")
-        
-        # 添加模型训练和评估部分
-        print("\n=== 模型训练和评估 ===")
-        
-        # 分割数据集为训练集和测试集
-        X = clean_dapt.drop(columns=['Label'])
-        y = clean_dapt['Label']
-        
-        # 对非数值特征进行编码
-        print("\n对非数值特征进行编码...")
-        X_encoded, encoders = encode_categorical_features(X)
-        print(f"编码后的特征形状: {X_encoded.shape}")
-        
-        # 使用皮尔逊相关性阈值0.9进行特征选择
-        print("\n=== 使用皮尔逊相关性阈值0.9进行特征选择 ===")
-        X_reduced, dropped_features = remove_correlated_features(X_encoded, threshold=0.9)
-        print(f"移除的特征数量: {len(dropped_features)}")
-        print(f"保留的特征数量: {X_reduced.shape[1]}")
-        
-        # 检查是否有Reconnaisance类别的样本
-        recon_samples = (y == 2).sum()
-        print(f"\n数据集中Reconnaisance类别的样本数量: {recon_samples}")
-        
-        # 如果有Reconnaisance样本，分析哪些特征对该类别最重要
-        if recon_samples > 0:
-            print("\n=== 分析Reconnaisance类别的重要特征 ===")
-            # 创建二元分类问题：Reconnaisance vs 其他
-            y_recon = (y == 2).astype(int)
-            
-            # 使用互信息计算每个特征对Reconnaisance分类的重要性
-            selector = SelectKBest(mutual_info_classif, k='all')
-            selector.fit(X_reduced, y_recon)
-            
-            # 获取特征重要性分数
-            recon_scores = selector.scores_
-            
-            # 创建特征名称和重要性分数的映射
-            recon_feature_importance = dict(zip(X_reduced.columns, recon_scores))
-            
-            # 按重要性排序
-            sorted_recon_features = sorted(recon_feature_importance.items(), key=lambda x: x[1], reverse=True)
-            
-            print(f"对Reconnaisance类别最重要的前10个特征:")
-            for i, (feature, score) in enumerate(sorted_recon_features[:10]):
-                print(f"{i+1}. {feature}: {score:.4f}")
-            
-            # 确保这些重要特征不会在后续特征选择中被过滤掉
-            top_recon_features = [feature for feature, _ in sorted_recon_features[:10]]
-            print(f"将确保保留这些对Reconnaisance类别重要的特征")
+
+        # 定义语义特征编码映射
+        self.semantic_mappings = {
+            'scan_intensity': {'low': 0, 'medium': 1, 'high': 2},
+            'probe_pattern': {'service': 0, 'random': 1, 'system': 2},
+            'collection_level': {'low': 0, 'medium': 1, 'high': 2},
+            'target_service': {'web': 0, 'apt_specific': 1, 'system': 2, 'high_port': 3},
+            'connection_mode': {'single': 0, 'burst': 1, 'persistent': 2},
+            'movement_pattern': {'direct': 0, 'indirect': 1, 'complex': 2},
+            'session_duration': {'short': 0, 'medium': 1, 'long': 2, 'very_long': 3},
+            'exfil_volume': {'small': 0, 'medium': 1, 'large': 2, 'massive': 3},
+            'transfer_mode': {'continuous': 0, 'burst': 1, 'stealth': 2}
+        }  # Note: IP addresses and Timestamp might be non-numeric or require special handling
+        self.stage_column = 'Stage'  # Define the column containing stage labels
+        self.unified_normal_label = '正常流量'
+
+    # REMOVED _extract_stage_from_filename as partitioning is now based on 'Stage' column
+
+    def _load_data_and_partition(self):
+        """Loads all CSVs, concatenates, unifies normal labels, and partitions by 'Stage'."""
+        print("--- Loading and Partitioning Data ---")
+        all_data_list = []
+        found_files = 0
+        for filename in os.listdir(self.csv_dir_path):
+            if filename.endswith(".csv"):
+                file_path = os.path.join(self.csv_dir_path, filename)
+                print(f"Loading data from {filename}...")
+                try:
+                    # Attempt to load with header=0 first
+                    df_chunk = pd.read_csv(file_path, header=0, low_memory=False)
+                    df_chunk.columns = df_chunk.columns.str.strip()  # Clean column names
+
+                    # Simple check: Does it have roughly the expected number of columns?
+                    # Or check if 'Stage' column exists?
+                    if self.stage_column not in df_chunk.columns:
+                        print(
+                            f"  Warning: File {filename} might be missing headers or the '{self.stage_column}' column. Attempting load with predefined columns.")
+                        df_chunk = pd.read_csv(file_path, header=None, names=USER_PROVIDED_COLUMNS, low_memory=False)
+                        df_chunk.columns = df_chunk.columns.str.strip()  # Clean again
+
+                    if self.stage_column not in df_chunk.columns:
+                        print(
+                            f"  Error: Could not find '{self.stage_column}' column in {filename} even with predefined names. Skipping file.")
+                        continue
+
+                    # Special handling for preprocessed data - convert numeric labels to text if needed
+                    if df_chunk[self.stage_column].dtype in [np.int64, np.float64]:
+                        print(f"  Detected numeric '{self.stage_column}' values. Converting to text labels...")
+                        # Create reverse mapping from numeric to text labels
+                        label_map = {
+                            0: "正常流量",  # Normal traffic
+                            1: "Reconnaissance",
+                            2: "Establish Foothold",
+                            3: "Lateral Movement",
+                            4: "Data Exfiltration"
+                        }
+                        df_chunk[self.stage_column] = df_chunk[self.stage_column].map(label_map)
+                        print("  Mapped numeric labels back to text labels.")
+
+                    all_data_list.append(df_chunk)
+                    found_files += 1
+                except Exception as e:
+                    print(f"  Error loading {filename}: {e}")
+
+        if not all_data_list:
+            raise RuntimeError("No valid CSV data loaded. Check directory path and files.")
+
+        # Concatenate all loaded data
+        print("Concatenating loaded data...")
+        combined_df = pd.concat(all_data_list, ignore_index=True)
+        print(f"Total samples loaded: {len(combined_df)}")
+
+        # Pre-partitioning check for stage column
+        if self.stage_column not in combined_df.columns:
+            raise ValueError(f"The required '{self.stage_column}' column was not found in the combined data.")
+
+        # --- Unify Normal Labels --- #
+        normal_labels_to_unify = ['benign', 'BENIGN', 'Benign', 0]  # Add others if needed, including numeric 0
+        original_stages = combined_df[self.stage_column].unique()
+        print(f"Original stages found: {original_stages}")
+        replace_map = {label: self.unified_normal_label for label in normal_labels_to_unify if label in original_stages}
+        if replace_map:
+            print(f"Unifying normal labels: Mapping {list(replace_map.keys())} to '{self.unified_normal_label}'")
+            combined_df[self.stage_column] = combined_df[self.stage_column].replace(replace_map)
+
+        # Replace infinite values with NaN globally
+        combined_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+        # Partition based on the 'Stage' column
+        stages_found = combined_df[self.stage_column].unique()
+        print(f"Stages after unification for partitioning: {stages_found}")
+
+        for stage_name in stages_found:
+            # Ensure stage_name is treated as string, handle potential NaN stage names if necessary
+            if pd.isna(stage_name):
+                print(f"  Warning: Found NaN value in '{self.stage_column}'. Skipping these rows.")
+                continue
+            stage_name_str = str(stage_name)
+
+            stage_df = combined_df[combined_df[
+                                       self.stage_column] == stage_name].copy()  # Use .copy() to avoid SettingWithCopyWarning later
+            if not stage_df.empty:
+                print(f"  Partitioning data for stage: '{stage_name_str}' ({len(stage_df)} samples)")
+                self.data_frames[stage_name_str] = stage_df
+                # Initialize dimension tracking for this stage
+                self.dimension_tracking[stage_name_str] = {
+                    'Original': stage_df.shape[1],  # Record original dimension
+                    'Cleaned': 0,
+                    'Selected': 0
+                }
+            else:
+                print(f"  Warning: No data found for stage '{stage_name_str}' after filtering.")
+
+        if not self.data_frames:
+            raise RuntimeError("No dataframes were created after partitioning by 'Stage'. Check 'Stage' column values.")
+        print(f"Successfully partitioned data into stages: {list(self.data_frames.keys())}")
+        print("-" * 30)
+
+    def _clean_data(self):
+        """Basic data cleaning: remove non-numeric columns and handle missing values."""
+        print("--- Data Cleaning ---")
+
+        for stage_name, df in self.data_frames.items():
+            original_shape = df.shape
+
+            # Convert all columns to numeric except Stage
+            for col in df.columns:
+                if col != 'Stage':
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+
+            # Fill missing values with 0
+            df = df.fillna(0)
+
+            # Remove non-numeric columns except Stage
+            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            if 'Stage' in df.columns:
+                numeric_cols.append('Stage')
+            df = df[numeric_cols]
+
+            self.data_frames[stage_name] = df
+            print(f"{stage_name}: {original_shape} -> {df.shape}")
+
+        print("-" * 30)
+
+    def _advanced_feature_selection(self):
+        """
+        Advanced feature selection based on variance, sparsity, and correlation analysis.
+        """
+        print("--- Advanced Feature Selection ---")
+
+        # Combine all data for global analysis
+        combined_data = pd.concat([df for df in self.data_frames.values()], ignore_index=True)
+        combined_data = combined_data.drop('Stage', axis=1)
+
+        # Convert to numeric
+        for col in combined_data.columns:
+            combined_data[col] = pd.to_numeric(combined_data[col], errors='coerce')
+        combined_data = combined_data.fillna(0)
+
+        original_features = len(combined_data.columns)
+        print(f"Original features: {original_features}")
+
+        # 1. Remove zero variance features
+        zero_var_features = combined_data.columns[combined_data.var() == 0].tolist()
+        combined_data = combined_data.drop(zero_var_features, axis=1)
+        print(f"Removed {len(zero_var_features)} zero variance features")
+
+        # 2. Remove low variance features (< 0.01)
+        low_var_features = combined_data.columns[combined_data.var() < 0.01].tolist()
+        combined_data = combined_data.drop(low_var_features, axis=1)
+        print(f"Removed {len(low_var_features)} low variance features (< 0.01)")
+
+        # 3. Remove high sparsity features (> 0.5)
+        sparsity = (combined_data == 0).mean()
+        high_sparse_features = sparsity[sparsity > 0.5].index.tolist()
+        combined_data = combined_data.drop(high_sparse_features, axis=1)
+        print(f"Removed {len(high_sparse_features)} high sparsity features (> 0.5)")
+
+        # 4. Remove highly correlated features (> 0.9)
+        if len(combined_data.columns) > 1:
+            corr_matrix = combined_data.corr().abs()
+            upper_tri = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+            high_corr_features = [column for column in upper_tri.columns if any(upper_tri[column] > 0.9)]
+            combined_data = combined_data.drop(high_corr_features, axis=1)
+            print(f"Removed {len(high_corr_features)} highly correlated features (> 0.9)")
+
+        self.selected_features = combined_data.columns.tolist()
+        final_features = len(self.selected_features)
+        print(f"Final features: {final_features} (reduced by {original_features - final_features})")
+
+        # Apply to all stage dataframes
+        for stage_name, df in self.data_frames.items():
+            cols_to_keep = [col for col in self.selected_features if col in df.columns] + ['Stage']
+            self.data_frames[stage_name] = df[cols_to_keep]
+
+    def _print_dimension_summary(self):
+        """Print simplified dimension summary."""
+        print("--- Feature Dimension Summary ---")
+        for stage_name, df in self.data_frames.items():
+            feature_count = len([col for col in df.columns if col != 'Stage'])
+            print(f"{stage_name}: {feature_count} features")
+
+        # 检查特征集类型
+        if hasattr(self, 'selected_features') and self.selected_features is not None:
+            print(f"Selected features: {len(self.selected_features)} (unified)")
+        elif hasattr(self, 'stage_selected_features'):
+            total_features = sum(len(features) for features in self.stage_selected_features.values())
+            print(f"Stage-specific features: {total_features} (independent)")
         else:
-            print("\n警告: 数据集中没有Reconnaisance类别的样本")
-            print("可能是由于数据预处理过程中的过滤导致，请检查数据处理步骤")
-            top_recon_features = []
-        
-        # 应用互信息特征选择，但确保保留对Reconnaisance/Reconnaissance重要的特征
-        print("\n=== 应用互信息特征选择 ===")
-        # 选择前40个最重要的特征（增加数量以包含更多可能重要的特征）
-        k = min(40, X_reduced.shape[1])
-        
-        # 使用互信息计算特征重要性
-        selector = SelectKBest(mutual_info_classif, k=k)
-        selector.fit(X_reduced, y)
-        
-        # 获取特征重要性分数
-        scores = selector.scores_
-        
-        # 创建特征名称和重要性分数的映射
-        feature_importance = dict(zip(X_reduced.columns, scores))
-        
-        # 按重要性排序
-        sorted_features = sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)
-        
-        print(f"互信息特征选择结果（选择前 {k} 个特征）:")
-        for i, (feature, score) in enumerate(sorted_features[:k]):
-            print(f"{i+1}. {feature}: {score:.4f}")
-        
-        # 获取选择的特征名称
-        selected_indices = selector.get_support(indices=True)
-        selected_features = X_reduced.columns[selected_indices]
-        
-        # 选择最终特征集
-        X_selected = X_reduced[selected_features]
-        print(f"选择的特征形状: {X_selected.shape}")
-        
-        # 可视化互信息特征重要性
-        plt.figure(figsize=(10, 6))
-        sorted_features = sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)[:k]
-        features, scores = zip(*sorted_features)
-        plt.barh(range(len(features)), scores, align='center')
-        plt.yticks(range(len(features)), features)
-        plt.xlabel('互信息分数')
-        plt.ylabel('特征')
-        plt.title('特征重要性（互信息）')
-        plt.tight_layout()
-        plt.savefig('feature_importance_mutual_info.png')
-        print("特征重要性图保存为 'feature_importance_mutual_info.png'")
-        
-        # 分割数据集为训练集和测试集
-        X_train, X_test, y_train, y_test = train_test_split(X_selected, y, test_size=0.3, random_state=42, stratify=y)
-        
-        print(f"训练集形状: {X_train.shape}")
-        print(f"测试集形状: {X_test.shape}")
-        print(f"训练集类别分布:\n{pd.Series(y_train).value_counts()}")
-        print(f"测试集类别分布:\n{pd.Series(y_test).value_counts()}")
-        
-        # 训练随机森林分类器
-        print("\n=== 训练随机森林分类器 ===")
-        rf_model = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
-        rf_model.fit(X_train, y_train)
-        
-        # 评估模型
-        y_pred = rf_model.predict(X_test)
-        accuracy = accuracy_score(y_test, y_pred)
-        precision, recall, f1, _ = precision_recall_fscore_support(y_test, y_pred, average='weighted')
-        
-        print("\n=== 模型评估结果 ===")
-        print(f"准确率: {accuracy:.4f}")
-        print(f"精确率: {precision:.4f}")
-        print(f"召回率: {recall:.4f}")
-        print(f"F1分数: {f1:.4f}")
-        
-        # 显示混淆矩阵
-        print("\n=== 模型混淆矩阵 ===")
-        cm = confusion_matrix(y_test, y_pred)
-        print(cm)
-        
-        # 使用新的函数显示类别指标
-        class_metrics = display_class_metrics(y_test, y_pred, drev, "")
-        
-        # 特征重要性分析
-        print("\n=== 特征重要性分析 ===")
-        feature_importances = rf_model.feature_importances_
-        feature_names = X_selected.columns
-        
-        # 获取前20个重要特征
-        indices = np.argsort(feature_importances)[::-1][:20]
-        print("前20个重要特征:")
-        for i, idx in enumerate(indices):
-            print(f"{i+1}. {feature_names[idx]}: {feature_importances[idx]:.4f}")
-        
-        # 保存模型（可选）
-        # joblib.dump(rf_model, 'rf_model.joblib')
-        # print("\n模型已保存为 'rf_model.joblib'")
-        
+            print("Feature selection: Not available")
+        print("-" * 30)
+
+    def _generate_dimension_table(self):
+        """生成并打印按阶段特征选择的维度变化汇总表"""
+        print("--- 按阶段特征选择维度变化汇总 ---")
+        if not self.dimension_tracking:
+            print("没有可用的维度跟踪信息。")
+            return
+
+        # 按照攻击阶段顺序排列
+        stage_order_keys = list(INTERNAL_STAGE_MAP.keys())
+        found_stages = list(self.dimension_tracking.keys())
+        ordered_stages = [s for s in stage_order_keys if s in found_stages] + \
+                         [s for s in found_stages if s not in stage_order_keys]
+
+        print("各阶段特征维度变化:")
+        for stage_name in ordered_stages:
+            dims = self.dimension_tracking.get(stage_name, {})
+            print(f"\n{stage_name}:")
+            print(f"  原始特征: {dims.get('Original', 'N/A')}")
+            print(f"  清洗后特征: {dims.get('Cleaned', 'N/A')}")
+            print(f"  最终选择特征: {dims.get('Selected', 'N/A')}")
+
+            # 显示该阶段独有的特征选择过程
+            if 'Stage_Selection' in dims:
+                stage_sel = dims['Stage_Selection']
+                print(f"  该阶段特征选择过程:")
+                print(f"    可选特征数: {stage_sel.get('available_for_selection', 'N/A')}")
+                print(f"    零方差筛选后: {stage_sel.get('after_zero_var_removal', 'N/A')}")
+                print(f"    低方差筛选后: {stage_sel.get('after_low_var_removal', 'N/A')}")
+                print(f"    稀疏性筛选后: {stage_sel.get('after_sparse_removal', 'N/A')}")
+                print(f"    相关性筛选后: {stage_sel.get('after_corr_removal', 'N/A')}")
+                print(f"    该阶段最终选择: {stage_sel.get('final_stage_selected', 'N/A')}")
+
+            if 'Stage_Specific_Features' in dims:
+                print(f"  该阶段独有特征数: {dims['Stage_Specific_Features']}")
+
+        # 显示全局汇总
+        print(f"\n全局特征选择汇总:")
+        if hasattr(self, 'stage_selected_features'):
+            all_stage_features = set()
+            for features in self.stage_selected_features.values():
+                all_stage_features.update(features)
+            print(f"  各阶段选择特征并集: {len(all_stage_features)} 个")
+
+        key_features_count = len([f for f in self.key_features if f in list(self.data_frames.values())[0].columns])
+        print(f"  关键特征数: {key_features_count} 个")
+
+        # 检查是否使用统一特征集或各阶段独立特征集
+        if hasattr(self, 'selected_features') and self.selected_features is not None:
+            # 统一特征集模式
+            print(f"  最终特征总数: {len(self.selected_features)} 个（统一特征集）")
+        elif hasattr(self, 'stage_selected_features'):
+            # 各阶段独立特征集模式
+            total_features = sum(len(features) for features in self.stage_selected_features.values())
+            print(f"  各阶段特征总数: {total_features} 个（各阶段独立特征集）")
+
+        print("-" * 30)
+
+    def _analyze_dataset_characteristics(self):
+        """分析数据集特征，包括数据分布、特征统计等"""
+        print("--- 数据集特征分析 ---")
+
+        # 分析每个攻击阶段的数据分布
+        print("各攻击阶段数据分布:")
+        for stage_name, df in self.data_frames.items():
+            print(f"  {stage_name}: {len(df)} 样本")
+
+        # 分析特征类型和分布
+        print("\n特征类型分析:")
+        if self.data_frames:
+            sample_df = list(self.data_frames.values())[0]
+            numeric_features = []
+            categorical_features = []
+
+            for col in sample_df.columns:
+                if col != 'Stage':
+                    if sample_df[col].dtype in ['int64', 'float64']:
+                        numeric_features.append(col)
+                    else:
+                        categorical_features.append(col)
+
+            print(f"  数值特征: {len(numeric_features)} 个")
+            print(f"  分类特征: {len(categorical_features)} 个")
+
+            # 显示前10个数值特征
+            if numeric_features:
+                print(f"  前10个数值特征: {numeric_features[:10]}")
+
+        print("-" * 30)
+
+    def _key_feature_analysis(self):
+        """关键特征分析 - 分析目标端口号、传输时间、总发送包数和总接收包数等关键特征"""
+        print("--- 关键特征分析 ---")
+
+        # 定义关键特征指标
+        key_feature_indicators = {
+            'Dst Port': '目标端口号',
+            'Flow Duration': '传输时间',
+            'Total Fwd Packet': '总发送包数',
+            'Total Bwd packets': '总接收包数',
+            'Timestamp': '时间戳',
+            'Src IP': '源IP地址',
+            'Dst IP': '目标IP地址'
+        }
+
+        print("关键特征指标分析:")
+        combined_data = pd.concat([df for df in self.data_frames.values()], ignore_index=True)
+
+        for feature, description in key_feature_indicators.items():
+            if feature in combined_data.columns:
+                print(f"\n{description} ({feature}):")
+                if combined_data[feature].dtype in ['int64', 'float64']:
+                    # 数值特征统计
+                    stats = combined_data[feature].describe()
+                    print(f"  均值: {stats['mean']:.2f}")
+                    print(f"  标准差: {stats['std']:.2f}")
+                    print(f"  最小值: {stats['min']:.2f}")
+                    print(f"  最大值: {stats['max']:.2f}")
+                    print(f"  缺失值: {combined_data[feature].isnull().sum()}")
+                else:
+                    # 分类特征统计
+                    unique_count = combined_data[feature].nunique()
+                    print(f"  唯一值数量: {unique_count}")
+                    print(f"  缺失值: {combined_data[feature].isnull().sum()}")
+                    if unique_count <= 20:  # 只显示少量唯一值
+                        print(f"  前10个值: {combined_data[feature].value_counts().head(10).to_dict()}")
+            else:
+                print(f"\n{description} ({feature}): 特征不存在")
+
+        print("-" * 30)
+
+    def _stage_wise_feature_selection(self):
+        """按阶段进行特征选择 - 为每个攻击阶段分别选择最优特征"""
+        print("--- 按阶段特征选择过程（排除关键特征指标）---")
+
+        # 存储每个阶段选择的特征
+        stage_selected_features = {}
+        stage_feature_stats = {}
+
+        # 排除关键特征指标和Stage列
+        features_to_exclude = set(self.key_features + ['Stage'])
+
+        print(f"原始特征数量: {len(list(self.data_frames.values())[0].columns) - 1}")  # 减去Stage列
+        print(
+            f"关键特征指标数量: {len([f for f in self.key_features if f in list(self.data_frames.values())[0].columns])}")
+
+        # 为每个阶段分别进行特征选择
+        for stage_name, df in self.data_frames.items():
+            print(f"\n处理阶段: {stage_name} ({len(df)} 样本)")
+
+            # 获取可用于特征选择的特征
+            available_features = [col for col in df.columns if col not in features_to_exclude]
+            print(f"  可用于特征选择的特征数量: {len(available_features)}")
+
+            # 提取特征数据
+            feature_data = df[available_features].copy()
+
+            # 转换为数值类型
+            for col in feature_data.columns:
+                feature_data[col] = pd.to_numeric(feature_data[col], errors='coerce')
+            feature_data = feature_data.fillna(0)
+
+            original_count = len(feature_data.columns)
+            stats = {'original': original_count}
+
+            # 1. 移除零方差特征
+            zero_var_features = feature_data.columns[feature_data.var() == 0].tolist()
+            feature_data = feature_data.drop(zero_var_features, axis=1)
+            stats['zero_var_removed'] = len(zero_var_features)
+            print(f"    移除零方差特征: {len(zero_var_features)} 个")
+
+            # 2. 移除低方差特征 (< 0.01)
+            low_var_features = feature_data.columns[feature_data.var() < 0.01].tolist()
+            feature_data = feature_data.drop(low_var_features, axis=1)
+            stats['low_var_removed'] = len(low_var_features)
+            print(f"    移除低方差特征 (< 0.01): {len(low_var_features)} 个")
+
+            # 3. 移除高稀疏性特征 (> 0.5)
+            sparsity = (feature_data == 0).mean()
+            high_sparse_features = sparsity[sparsity > 0.5].index.tolist()
+            feature_data = feature_data.drop(high_sparse_features, axis=1)
+            stats['high_sparse_removed'] = len(high_sparse_features)
+            print(f"    移除高稀疏性特征 (> 0.5): {len(high_sparse_features)} 个")
+
+            # 4. 移除高相关性特征 (> 0.8)
+            high_corr_removed = 0
+            if len(feature_data.columns) > 1:
+                corr_matrix = feature_data.corr().abs()
+                upper_tri = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+                high_corr_features = [column for column in upper_tri.columns if any(upper_tri[column] > 0.8)]
+                feature_data = feature_data.drop(high_corr_features, axis=1)
+                high_corr_removed = len(high_corr_features)
+            stats['high_corr_removed'] = high_corr_removed
+            print(f"    移除高相关性特征 (> 0.8): {high_corr_removed} 个")
+
+            # 5. 基于方差的特征选择 (选择前30个最高方差的特征)
+            if len(feature_data.columns) > 30:
+                feature_variances = feature_data.var().sort_values(ascending=False)
+                top_variance_features = feature_variances.head(30).index.tolist()
+                feature_data = feature_data[top_variance_features]
+                stats['variance_selected'] = 30
+                print(f"    基于方差选择特征: {len(top_variance_features)} 个")
+            else:
+                stats['variance_selected'] = len(feature_data.columns)
+                print(f"    保留所有剩余特征: {len(feature_data.columns)} 个")
+
+            # 存储该阶段选择的特征
+            stage_selected_features[stage_name] = feature_data.columns.tolist()
+            stage_feature_stats[stage_name] = stats
+
+            print(f"    {stage_name} 最终选择特征数: {len(feature_data.columns)}")
+
+        # 使用语义特征编码替代传统特征选择
+        print(f"\n语义特征编码汇总:")
+
+        # 存储每个阶段的特征选择统计（用于兼容性）
+        self.stage_feature_stats = stage_feature_stats
+        self.stage_selected_features = {}
+
+        # 为每个阶段提取语义特征
+        for stage_name, df in self.data_frames.items():
+            # 提取语义特征
+            semantic_df = self.extract_semantic_features(df, stage_name)
+            self.data_frames[stage_name] = semantic_df
+
+            # 记录语义特征名称
+            semantic_features = [col for col in semantic_df.columns if col != 'Stage']
+            self.stage_selected_features[stage_name] = semantic_features
+
+            print(f"  {stage_name}: {len(semantic_features)} 个语义特征")
+            print(f"    语义特征: {semantic_features}")
+
+        # 不设置统一的selected_features，因为每个阶段都有独立的语义特征集
+        self.selected_features = None  # 标记为None，表示使用各阶段独立语义特征
+
+        print("-" * 30)
+
+    def _update_dimension_tracking(self):
+        """更新维度跟踪信息 - 包含按阶段特征选择的详细信息"""
+        print("--- 更新维度跟踪信息 ---")
+
+        for stage_name, df in self.data_frames.items():
+            if stage_name in self.dimension_tracking:
+                # 更新清洗后的维度
+                self.dimension_tracking[stage_name]['Cleaned'] = df.shape[1] - 1  # 减去Stage列
+                # 更新最终选择后的维度
+                self.dimension_tracking[stage_name]['Selected'] = len([col for col in df.columns if col != 'Stage'])
+
+                # 添加按阶段特征选择的详细信息
+                if hasattr(self, 'stage_feature_stats') and stage_name in self.stage_feature_stats:
+                    stats = self.stage_feature_stats[stage_name]
+                    self.dimension_tracking[stage_name]['Stage_Selection'] = {
+                        'available_for_selection': stats['original'],
+                        'after_zero_var_removal': stats['original'] - stats['zero_var_removed'],
+                        'after_low_var_removal': stats['original'] - stats['zero_var_removed'] - stats[
+                            'low_var_removed'],
+                        'after_sparse_removal': stats['original'] - stats['zero_var_removed'] - stats[
+                            'low_var_removed'] - stats['high_sparse_removed'],
+                        'after_corr_removal': stats['original'] - stats['zero_var_removed'] - stats['low_var_removed'] -
+                                              stats['high_sparse_removed'] - stats['high_corr_removed'],
+                        'final_stage_selected': stats['variance_selected']
+                    }
+
+                # 添加该阶段独有的特征信息
+                if hasattr(self, 'stage_selected_features') and stage_name in self.stage_selected_features:
+                    stage_specific_features = len(self.stage_selected_features[stage_name])
+                    self.dimension_tracking[stage_name]['Stage_Specific_Features'] = stage_specific_features
+
+        print("维度跟踪信息已更新（包含按阶段特征选择详情）")
+        print("-" * 30)
+
+    def extract_semantic_features(self, df, stage_name):
+        """
+        从原始特征中提取攻击语义特征
+
+        Args:
+            df: 数据框
+            stage_name: 阶段名称
+
+        Returns:
+            semantic_df: 包含语义特征的数据框
+        """
+        print(f"--- 提取 {stage_name} 阶段的语义特征 ---")
+
+        semantic_data = []
+
+        for _, row in df.iterrows():
+            if stage_name == 'Reconnaissance':
+                semantic_features = self._extract_reconnaissance_semantics(row)
+            elif stage_name == 'Establish Foothold':
+                semantic_features = self._extract_foothold_semantics(row)
+            elif stage_name == 'Lateral Movement':
+                semantic_features = self._extract_lateral_semantics(row)
+            elif stage_name == 'Data Exfiltration':
+                semantic_features = self._extract_exfiltration_semantics(row)
+            else:  # Normal traffic
+                semantic_features = self._extract_normal_semantics(row)
+
+            semantic_data.append(semantic_features)
+
+        # 创建语义特征数据框
+        if stage_name == 'Reconnaissance':
+            columns = ['scan_intensity', 'probe_pattern', 'collection_level']
+        elif stage_name == 'Establish Foothold':
+            columns = ['target_service', 'connection_mode']
+        elif stage_name == 'Lateral Movement':
+            columns = ['movement_pattern', 'session_duration']
+        elif stage_name == 'Data Exfiltration':
+            columns = ['exfil_volume', 'transfer_mode']
+        else:  # Normal
+            columns = ['traffic_pattern', 'service_type', 'volume_level']
+
+        semantic_df = pd.DataFrame(semantic_data, columns=columns)
+        semantic_df['Stage'] = stage_name
+
+        print(f"语义特征提取完成: {len(semantic_df)} 个样本, {len(columns)} 个语义特征")
+        return semantic_df
+
+    def _extract_reconnaissance_semantics(self, row):
+        """提取侦察阶段的语义特征"""
+        # 扫描强度（基于数据包数量）
+        total_packets = row.get('Total Fwd Packet', 0) + row.get('Total Bwd packets', 0)
+        if total_packets > 100:
+            scan_intensity = self.semantic_mappings['scan_intensity']['high']
+        elif total_packets > 20:
+            scan_intensity = self.semantic_mappings['scan_intensity']['medium']
+        else:
+            scan_intensity = self.semantic_mappings['scan_intensity']['low']
+
+        # 探测模式（基于目标端口）
+        port = row.get('Dst Port', 0)
+        if port in [80, 443, 22, 21, 25, 53]:
+            probe_pattern = self.semantic_mappings['probe_pattern']['service']
+        elif port > 1024:
+            probe_pattern = self.semantic_mappings['probe_pattern']['random']
+        else:
+            probe_pattern = self.semantic_mappings['probe_pattern']['system']
+
+        # 数据收集量（基于传输数据量）
+        data_volume = row.get('Total Length of Fwd Packet', 0)
+        if data_volume > 10000:
+            collection_level = self.semantic_mappings['collection_level']['high']
+        elif data_volume > 1000:
+            collection_level = self.semantic_mappings['collection_level']['medium']
+        else:
+            collection_level = self.semantic_mappings['collection_level']['low']
+
+        return [scan_intensity, probe_pattern, collection_level]
+
+    def _extract_foothold_semantics(self, row):
+        """提取建立立足点阶段的语义特征"""
+        # 目标服务类型（基于端口号）
+        port = row.get('Dst Port', 0)
+        if port in [80, 443]:
+            target_service = self.semantic_mappings['target_service']['web']
+        elif port == 9003:
+            target_service = self.semantic_mappings['target_service']['apt_specific']
+        elif port < 1024:
+            target_service = self.semantic_mappings['target_service']['system']
+        else:
+            target_service = self.semantic_mappings['target_service']['high_port']
+
+        # 连接模式（基于流持续时间和数据包数量）
+        duration = row.get('Flow Duration', 0)
+        packets = row.get('Total Fwd Packet', 0) + row.get('Total Bwd packets', 0)
+
+        if duration > 60000 and packets > 50:  # 长时间多包
+            connection_mode = self.semantic_mappings['connection_mode']['persistent']
+        elif packets > 20:  # 短时间多包
+            connection_mode = self.semantic_mappings['connection_mode']['burst']
+        else:  # 单次连接
+            connection_mode = self.semantic_mappings['connection_mode']['single']
+
+        return [target_service, connection_mode]
+
+    def _extract_lateral_semantics(self, row):
+        """提取横向移动阶段的语义特征"""
+        # 移动模式（基于流间到达时间和持续时间）
+        iat_mean = row.get('Flow IAT Mean', 0)
+        duration = row.get('Flow Duration', 0)
+
+        if iat_mean > 1000 and duration > 30000:  # 间隔大，持续长
+            movement_pattern = self.semantic_mappings['movement_pattern']['complex']
+        elif iat_mean > 500:  # 中等间隔
+            movement_pattern = self.semantic_mappings['movement_pattern']['indirect']
+        else:  # 直接连接
+            movement_pattern = self.semantic_mappings['movement_pattern']['direct']
+
+        # 会话持续时间
+        duration = row.get('Flow Duration', 0)
+        if duration > 100000:  # 超长会话
+            session_duration = self.semantic_mappings['session_duration']['very_long']
+        elif duration > 30000:  # 长会话
+            session_duration = self.semantic_mappings['session_duration']['long']
+        elif duration > 5000:  # 中等会话
+            session_duration = self.semantic_mappings['session_duration']['medium']
+        else:  # 短会话
+            session_duration = self.semantic_mappings['session_duration']['short']
+
+        return [movement_pattern, session_duration]
+
+    def _extract_exfiltration_semantics(self, row):
+        """提取数据窃取阶段的语义特征"""
+        # 窃取数据量（基于总传输数据量）
+        total_data = row.get('Total Length of Fwd Packet', 0) + row.get('Total Length of Bwd Packet', 0)
+        if total_data > 100000:  # 大量数据
+            exfil_volume = self.semantic_mappings['exfil_volume']['massive']
+        elif total_data > 10000:  # 较多数据
+            exfil_volume = self.semantic_mappings['exfil_volume']['large']
+        elif total_data > 1000:  # 中等数据
+            exfil_volume = self.semantic_mappings['exfil_volume']['medium']
+        else:  # 少量数据
+            exfil_volume = self.semantic_mappings['exfil_volume']['small']
+
+        # 传输模式（基于数据包大小和间隔）
+        avg_packet_size = row.get('Average Packet Size', 0)
+        iat_std = row.get('Flow IAT Std', 0)
+
+        if avg_packet_size < 100 and iat_std > 1000:  # 小包，不规律间隔
+            transfer_mode = self.semantic_mappings['transfer_mode']['stealth']
+        elif iat_std > 500:  # 突发传输
+            transfer_mode = self.semantic_mappings['transfer_mode']['burst']
+        else:  # 连续传输
+            transfer_mode = self.semantic_mappings['transfer_mode']['continuous']
+
+        return [exfil_volume, transfer_mode]
+
+    def _extract_normal_semantics(self, row):
+        """提取正常流量的语义特征"""
+        # 流量模式（基于数据包数量和持续时间）
+        packets = row.get('Total Fwd Packet', 0) + row.get('Total Bwd packets', 0)
+        duration = row.get('Flow Duration', 0)
+
+        if packets > 50 and duration > 10000:
+            traffic_pattern = 0  # 长连接
+        elif packets > 20:
+            traffic_pattern = 1  # 短连接多包
+        else:
+            traffic_pattern = 2  # 简单连接
+
+        # 服务类型（基于端口）
+        port = row.get('Dst Port', 0)
+        if port in [80, 443]:
+            service_type = 0  # Web服务
+        elif port in [22, 21, 25, 53]:
+            service_type = 1  # 系统服务
+        else:
+            service_type = 2  # 其他服务
+
+        # 流量量级
+        data_volume = row.get('Total Length of Fwd Packet', 0)
+        if data_volume > 5000:
+            volume_level = 0  # 大流量
+        elif data_volume > 500:
+            volume_level = 1  # 中流量
+        else:
+            volume_level = 2  # 小流量
+
+        return [traffic_pattern, service_type, volume_level]
+
+    def _save_results(self):
+        """保存预处理结果 - 各阶段独立特征"""
+        print(f"--- 保存预处理结果到 {self.output_path} ---")
+
+        try:
+            # 保存各阶段的语义特征信息
+            stage_features_path = os.path.join(self.output_path, 'stage_features.json')
+            stage_features_info = {}
+
+            for stage_name, df in self.data_frames.items():
+                # 获取该阶段的语义特征列表（排除Stage列）
+                stage_features = [col for col in df.columns if col != 'Stage']
+                stage_features_info[stage_name] = {
+                    'features': stage_features,
+                    'feature_count': len(stage_features),
+                    'feature_type': 'semantic',
+                    'semantic_mappings': {
+                        feature: self.semantic_mappings.get(feature, {})
+                        for feature in stage_features
+                        if feature in self.semantic_mappings
+                    },
+                    'selected_features': self.stage_selected_features.get(stage_name, []) if hasattr(self,
+                                                                                                     'stage_selected_features') else []
+                }
+
+            with open(stage_features_path, 'w', encoding='utf-8') as f:
+                json.dump(stage_features_info, f, indent=4, ensure_ascii=False)
+            print(f"  已保存各阶段语义特征信息到: {stage_features_path}")
+
+            # 保存每个阶段的预处理数据
+            for stage_name, df in self.data_frames.items():
+                stage_path = os.path.join(self.output_path, f'{stage_name}_preprocessed.csv')
+                df.to_csv(stage_path, index=False, encoding='utf-8')
+                print(
+                    f"  已保存 {stage_name} 预处理数据到: {stage_path} ({len([col for col in df.columns if col != 'Stage'])} 个特征)")
+
+            # 保存维度跟踪信息
+            dimension_path = os.path.join(self.output_path, 'dimension_tracking.json')
+            with open(dimension_path, 'w', encoding='utf-8') as f:
+                json.dump(self.dimension_tracking, f, indent=4, ensure_ascii=False)
+            print(f"  已保存维度跟踪信息到: {dimension_path}")
+
+            print("保存完成（各阶段保持独立特征集）。")
+
+        except Exception as e:
+            print(f"保存结果时出错: {e}")
+
+        print("-" * 30)
+
+    # --- 主要预处理方法 ---
+
+    def preprocess(self):
+        """数据预处理管道 - 专注于数据清洗和特征选择"""
+        print("===== 开始 DAPT 数据预处理管道 =====")
+        start_time = time.time()
+
+        # 1. 加载和分区数据
+        self._load_data_and_partition()
+
+        # 2. 数据集特征分析
+        self._analyze_dataset_characteristics()
+
+        # 3. 数据清洗
+        self._clean_data()
+
+        # 4. 关键特征分析
+        self._key_feature_analysis()
+
+        # 5. 按阶段特征选择（排除关键特征）
+        self._stage_wise_feature_selection()
+
+        # 6. 更新维度跟踪
+        self._update_dimension_tracking()
+
+        # 7. 生成维度变化表
+        self._generate_dimension_table()
+
+        # 8. 保存结果
+        self._save_results()
+
+        end_time = time.time()
+        print(f"===== 预处理管道完成 ({end_time - start_time:.2f} 秒) =====")
+
+        # 返回各阶段独立的特征信息
+        stage_features = {}
+        if hasattr(self, 'stage_selected_features'):
+            stage_features = self.stage_selected_features
+
+        return self.data_frames, stage_features, self.dimension_tracking
+
+
+if __name__ == '__main__':
+    # 使用示例:
+    # 重要: 请替换为您的 DAPT2020 CSV 目录的实际路径
+    CSV_DIRECTORY = r'D:\PycharmProjects\DSRL-APT-2023'  # DAPT2020 CSV 文件路径
+    OUTPUT_DIRECTORY = './preprocessed_output'  # 保存预处理文件的目录
+
+    # 如果输出目录不存在则创建
+    os.makedirs(OUTPUT_DIRECTORY, exist_ok=True)
+
+    # 检查目录是否存在
+    if not os.path.isdir(CSV_DIRECTORY):
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        print("!!! 警告: 请检查 'CSV_DIRECTORY' 变量                        !!!")
+        print("!!! 它应该指向包含您的 CSV 文件的目录。                        !!!")
+        print(f"!!! 当前路径: {CSV_DIRECTORY}")
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        print("\n使用可能不正确的路径继续...")
+
+    try:
+        preprocessor = DAPTPreprocessor(CSV_DIRECTORY, OUTPUT_DIRECTORY)
+        # 运行完整的预处理管道
+        data_frames, stage_features, dimension_tracking = preprocessor.preprocess()
+
+        print("\n--- 预处理结果摘要（语义特征编码）---")
+        print(f"处理的攻击阶段数量: {len(data_frames)}")
+
+        print("\n各阶段数据量和语义特征数:")
+        for stage_name, df in data_frames.items():
+            feature_count = len([col for col in df.columns if col != 'Stage'])
+            print(f"  {stage_name}: {len(df)} 样本, {feature_count} 个语义特征")
+
+        print(f"\n各阶段语义特征详情:")
+        for stage_name, features in stage_features.items():
+            if features:
+                print(f"  {stage_name}: {len(features)} 个语义特征")
+                print(f"    语义特征: {features}")
+
+        print(f"\n语义特征映射统计:")
+        total_tokens = 0
+        for stage_name, features in stage_features.items():
+            stage_tokens = 0
+            for feature in features:
+                if feature in preprocessor.semantic_mappings:
+                    tokens = len(preprocessor.semantic_mappings[feature])
+                    stage_tokens += tokens
+                    print(f"    {feature}: {tokens} 个token")
+            total_tokens += stage_tokens
+            print(f"  {stage_name} 总计: {stage_tokens} 个token")
+
+        print(f"\n总词汇表大小预估: ~{total_tokens} 个token")
+        print("注意: 各攻击阶段现在使用语义特征编码，大幅降低了特征维度")
+
     except Exception as e:
-        print(f"预处理数据或训练模型时出错: {e}")
+        print(f"\n预处理过程中发生错误: {e}")
         import traceback
+
         traceback.print_exc()
-    
-    print("\n处理完成!")
-    if 'Session_ID' not in clean_dapt.columns and 'Session_ID' in dapt2020.columns:
-        clean_dapt['Session_ID'] = dapt2020['Session_ID'].values
-    clean_dapt.to_csv("clean_dapt.csv", index=False)
-    print("已保存clean_dapt.csv，供APT序列构建器使用")
-
-
