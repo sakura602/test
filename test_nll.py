@@ -219,6 +219,11 @@ class DAPTPreprocessor:
 
         print("-" * 30)
 
+
+
+
+
+
     def _advanced_feature_selection(self):
         """
         Advanced feature selection based on variance, sparsity, and correlation analysis.
@@ -429,8 +434,7 @@ class DAPTPreprocessor:
         features_to_exclude = set(self.key_features + ['Stage'])
 
         print(f"原始特征数量: {len(list(self.data_frames.values())[0].columns) - 1}")  # 减去Stage列
-        print(
-            f"关键特征指标数量: {len([f for f in self.key_features if f in list(self.data_frames.values())[0].columns])}")
+        print(f"关键特征指标数量: {len([f for f in self.key_features if f in list(self.data_frames.values())[0].columns])}")
 
         # 为每个阶段分别进行特征选择
         for stage_name, df in self.data_frames.items():
@@ -540,12 +544,9 @@ class DAPTPreprocessor:
                     self.dimension_tracking[stage_name]['Stage_Selection'] = {
                         'available_for_selection': stats['original'],
                         'after_zero_var_removal': stats['original'] - stats['zero_var_removed'],
-                        'after_low_var_removal': stats['original'] - stats['zero_var_removed'] - stats[
-                            'low_var_removed'],
-                        'after_sparse_removal': stats['original'] - stats['zero_var_removed'] - stats[
-                            'low_var_removed'] - stats['high_sparse_removed'],
-                        'after_corr_removal': stats['original'] - stats['zero_var_removed'] - stats['low_var_removed'] -
-                                              stats['high_sparse_removed'] - stats['high_corr_removed'],
+                        'after_low_var_removal': stats['original'] - stats['zero_var_removed'] - stats['low_var_removed'],
+                        'after_sparse_removal': stats['original'] - stats['zero_var_removed'] - stats['low_var_removed'] - stats['high_sparse_removed'],
+                        'after_corr_removal': stats['original'] - stats['zero_var_removed'] - stats['low_var_removed'] - stats['high_sparse_removed'] - stats['high_corr_removed'],
                         'final_stage_selected': stats['variance_selected']
                     }
 
@@ -767,8 +768,7 @@ class DAPTPreprocessor:
                         for feature in stage_features
                         if feature in self.semantic_mappings
                     },
-                    'selected_features': self.stage_selected_features.get(stage_name, []) if hasattr(self,
-                                                                                                     'stage_selected_features') else []
+                    'selected_features': self.stage_selected_features.get(stage_name, []) if hasattr(self, 'stage_selected_features') else []
                 }
 
             with open(stage_features_path, 'w', encoding='utf-8') as f:
@@ -779,8 +779,7 @@ class DAPTPreprocessor:
             for stage_name, df in self.data_frames.items():
                 stage_path = os.path.join(self.output_path, f'{stage_name}_preprocessed.csv')
                 df.to_csv(stage_path, index=False, encoding='utf-8')
-                print(
-                    f"  已保存 {stage_name} 预处理数据到: {stage_path} ({len([col for col in df.columns if col != 'Stage'])} 个特征)")
+                print(f"  已保存 {stage_name} 预处理数据到: {stage_path} ({len([col for col in df.columns if col != 'Stage'])} 个特征)")
 
             # 保存维度跟踪信息
             dimension_path = os.path.join(self.output_path, 'dimension_tracking.json')
@@ -892,5 +891,4 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"\n预处理过程中发生错误: {e}")
         import traceback
-
         traceback.print_exc()
